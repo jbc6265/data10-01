@@ -1,6 +1,7 @@
 // 실행: node test/logic.test.mjs   (의존성 없음 — vendor 의 SheetJS 만 씀)
 // 실제 프레스 로그는 아직 받지 않았습니다. 여기서는 손으로 만든 작은 표와 가상 샘플 90일로 검사합니다.
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const L = require('../js/logic.js');
@@ -83,6 +84,37 @@ test('여러 시트 중 로그 시트를 고름', () => {
 });
 
 console.log('누적 · 타수 계산');
+test('2초 간격 CSV — 3,600행 보존, 금형 누적 자동 연결, 실제 타수 719타', () => {
+  const bytes = readFileSync(new URL('../samples/프레스로그_2초간격_2시간.csv', import.meta.url));
+  const wb = XLSX.read(L.decodeCsv(bytes).text, { type: 'string', raw: true });
+  const aoa = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1 });
+  const p = L.parseSheet(aoa);
+  assert.equal(p.records.length, 3600);
+  assert.equal(p.det.map.strokes, undefined);
+  assert.equal(p.det.map.dieCum, 5);
+  assert.equal(p.records[0].runHr, null);
+  assert.equal(p.records[1].time, '09:00:02');
+  const merged = L.mergeRecords([], p.records);
+  assert.equal(merged.records.length, 3600);
+  assert.equal(L.mergeRecords(merged.records, p.records).records.length, 3600);
+  const d = L.deriveStrokes(merged.records);
+  assert.equal(d.rows.reduce((sum, r) => sum + (r.s || 0), 0), 719);
+  assert.equal(d.stat.noPrev, 1);
+  assert.equal(d.stat.mismatch, 0);
+  assert.equal(d.rows[4].s, 0); assert.equal(d.rows[5].s, 1);
+  assert.equal(d.rows.at(-1).dieCum, 719);
+  const manual = L.parseSheet(aoa, { overrides: { strokes: 5, dieCum: -1 } });
+  assert.equal(manual.records[5].strokes, 1);
+  assert.equal(manual.records[5].dieCum, null);
+});
+test('초 단위 — 문자열·엑셀 일련번호·Date·별도 시각 및 분 단위와 중복 키 호환', () => {
+  assert.equal(L.toDateTime('2026-10-01 09:00:02').time, '09:00:02');
+  assert.equal(L.toDateTime(46296 + 32402 / 86400).time, '09:00:02');
+  assert.equal(L.toDateTime(new Date(2026, 9, 1, 9, 0, 2)).time, '09:00:02');
+  assert.equal(L.toTime('09:00:02'), '09:00:02');
+  assert.equal(L.toTime(32402 / 86400), '09:00:02');
+  assert.equal(L.recKey({ date: '2026-10-01', time: '09:00', press: 'P1' }), L.recKey({ date: '2026-10-01', time: '09:00:00', press: 'P1' }));
+});
 test('같은 행(일자+시각+프레스+금형)은 다시 가져오면 새 값으로 — 두 번 세지 않음', () => {
   const a = [{ date: '2026-10-01', time: '', press: 'P1', die: 'M', strokes: 10 }];
   const m = L.mergeRecords(a, [{ date: '2026-10-01', time: '', press: 'P1', die: 'M', strokes: 12 }, { date: '2026-10-02', time: '', press: 'P1', die: 'M', strokes: 5 }]);
