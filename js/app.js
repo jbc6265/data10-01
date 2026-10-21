@@ -215,7 +215,7 @@
           h('a', { class: 'btn', href: 'samples/' + encodeURIComponent('프레스로그_샘플_2026-10.csv'), download: '' }, '샘플 CSV 내려받기(10월)')),
         h('ul', { class: 'note' },
           h('li', null, '한 행 = 한 프레스의 한 기록(하루 또는 시각별)입니다. 꼭 필요한 열은 일자와 프레스이고, 나머지(프레스 종류·금형명·타수·누적 타수·가동 시간·전류·전압·온도·진동)는 있는 만큼 씁니다.'),
-          h('li', null, '타수는 「타수」 열이 있으면 그 값을, 없으면 같은 프레스의 「프레스 누적 타수」 차이를, 그것도 없으면 「금형 누적 타수」 차이를 씁니다. 「금형 타수」 열은 그 행에서 친 횟수로 읽습니다.'),
+          h('li', null, '타수는 「타수」 열이 있으면 그 값을, 없으면 「프레스 누적 타수」 차이, 그것도 없으면 「금형 누적 타수」 차이를 씁니다. 시각과 프레스 누적 타수가 있는 로그의 「금형 타수」는 누적값으로 자동 연결합니다. 일별 로그에서는 행별 횟수로 읽으며 열 연결에서 변경할 수 있습니다. 초 단위 시각을 지원하고 가동 시간은 생략할 수 있습니다.'),
           h('li', null, '같은 행(일자 + 시각 + 프레스 + 금형)을 다시 가져오면 새 값으로 바뀝니다. 같은 파일을 두 번 넣어도 두 번 세지 않습니다.'),
           h('li', null, 'CSV 는 UTF-8 과 한글 엑셀이 저장한 CP949(EUC-KR) 를 알아서 가려 읽습니다.'),
           h('li', null, '파일은 서버로 보내지 않고 이 브라우저 안에서만 읽습니다.')),
@@ -489,13 +489,18 @@
       }));
     }), { cls: 'matrix' });
     var mine = A.anomalies.filter(function (a) { return a.press === ui.press; });
+    var timed = A.rows.some(function (r) { return r.press === ui.press && r.time; });
     var figs = mine.map(function (a) {
+      var points = timed ? A.rows.filter(function (r) {
+        return r.press === ui.press && r[a.channel] != null;
+      }).map(function (r) { return { date: r.date, time: r.time || '00:00:00', v: r[a.channel] }; }) : a.points;
       return h('section', { class: 'card an lv-' + a.level },
         h('div', { class: 'an-top' }, pill(a.level), h('strong', null, ui.press + ' · ' + a.label + (a.unit ? '(' + a.unit + ')' : ''))),
         h('p', { class: 'an-ev' }, a.evidence),
         a.base ? h('p', { class: 'note' }, '기준선 구간 ' + a.base.from + ' ~ ' + a.base.to + ' (가동일 ' + a.base.n + '일) · 최근 구간 ' + a.recent.from + ' ~ ' + a.recent.to + ' (가동일 ' + a.recent.n + '일) · σ ' + N(a.base.sigma, 3) + a.unit +
           (a.base.floored ? ' (값이 거의 같아 기준선의 0.5% 를 바닥값으로 씀)' : '')) : null,
-        C.sensorFigure(a.label + ' 하루 평균 — ' + ui.press, { points: a.points, base: a.base, recentFrom: a.recent.from, unit: a.unit, k: R.k, kWarn: R.kWarn, color: CH_COLOR[a.channel] }));
+        timed ? h('p', { class: 'note' }, '차트는 수집 시각별 원시값을 표시합니다. 위 이상 판정은 일평균 기준이며 차트의 개별 측정값에는 적용하지 않습니다.') : null,
+        C.sensorFigure(a.label + (timed ? ' 수집 시각별 측정값 — ' : ' 하루 평균 — ') + ui.press, { points: points, timed: timed, base: timed ? null : a.base, recentFrom: timed ? null : a.recent.from, unit: a.unit, k: R.k, kWarn: R.kWarn, color: CH_COLOR[a.channel] }));
     });
     return [
       pageHead('③', '이상 감지 (통계 기준)', '평소(기준선)보다 벗어난 날이 이어지는지를 봅니다. 고장 기록으로 배운 예측이 아니라 「평소와 다름」을 알리는 1단계입니다.'),
