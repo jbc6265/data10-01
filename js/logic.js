@@ -17,16 +17,17 @@
   /* ── 1. 열 이름 ────────────────────────────────────────────────
      머리행 글자에서 괄호 속(단위)을 떼고, 공백·가운데점 등을 빼고 소문자로 맞춘 뒤 아래 별칭과 비교합니다.
      수강생이 올릴 수 있다고 한 칸: 프레스 종류 · 금형명 · 프레스 누적 타수 · 금형 타수 · 가동 시간 · 전류 · 전압 · 온도 (+ 보유 데이터의 진동)
-     「금형 타수」는 그 행에서 친 횟수로 읽습니다(교체 때 0 으로 돌아가는 누적 카운터라면 열 연결에서 「금형 누적 타수」로 바꿈). */
+     「금형 타수」는 금형 교체 때 0 으로 돌아가는 누적 카운터로 읽습니다(2026-10-21 수강생 로그 실측: 0 → 719 로 오름).
+     그 행에서 친 횟수라면 열 이름을 「타수」로 하거나 열 연결에서 「타수」로 바꿉니다. */
   var FIELDS = [
     { id: 'date', label: '일자(일시)', req: true, aliases: ['일자', '날짜', '일시', '생산일자', '작업일자', '측정일시', '측정일자', '기록일시', '수집일시', 'date', 'datetime', 'timestamp'] },
     { id: 'time', label: '시각', req: false, aliases: ['시각', '측정시각', '기록시각', '수집시각', 'time'] },
     { id: 'press', label: '프레스(설비)', req: true, aliases: ['프레스', '프레스명', '프레스번호', '프레스no', '설비', '설비명', '설비번호', '설비코드', '호기', 'press'] },
     { id: 'pressType', label: '프레스 종류', req: false, aliases: ['프레스종류', '종류', '설비종류', '기종', '프레스기종', '프레스유형', '톤수', 'type'] },
     { id: 'die', label: '금형명', req: false, aliases: ['금형', '금형명', '금형번호', '금형코드', '금형no', 'die', 'mold'] },
-    { id: 'strokes', label: '타수(이 행에서 친 횟수)', req: false, aliases: ['타수', '일타수', '생산타수', '작업타수', '금형타수', 'stroke', 'strokes'] },
+    { id: 'strokes', label: '타수(이 행에서 친 횟수)', req: false, aliases: ['타수', '일타수', '생산타수', '작업타수', 'stroke', 'strokes'] },
     { id: 'pressCum', label: '프레스 누적 타수', req: false, aliases: ['프레스누적타수', '누적타수', '총타수', '설비누적타수', '프레스총타수'] },
-    { id: 'dieCum', label: '금형 누적 타수', req: false, aliases: ['금형누적타수', '금형누적', '금형총타수'] },
+    { id: 'dieCum', label: '금형 (누적) 타수', req: false, aliases: ['금형누적타수', '금형누적', '금형총타수', '금형타수'] },
     { id: 'runHr', label: '가동 시간', req: false, aliases: ['가동시간', '가동', '운전시간', '가동hr', '가동시간hr'] },
     { id: 'current', label: '전류(A)', req: false, aliases: ['전류', '부하전류', '모터전류', '메인모터전류', '전류값', 'current'] },
     { id: 'voltage', label: '전압(V)', req: false, aliases: ['전압', '전압값', 'voltage'] },
@@ -88,14 +89,11 @@
     return x.getUTCMonth() === m - 1 ? isoFromUTC(t) : '';
   }
   function hm(h, m) { return (h >= 0 && h < 24 && m >= 0 && m < 60) ? pad(h) + ':' + pad(m) : ''; }
-  function hms(h, m, s) {
-    var t = hm(h, m);
-    return t && (s == null || (s >= 0 && s < 60)) ? t + (s == null ? '' : ':' + pad(s)) : '';
-  }
   /* 일(fraction) → 'HH:MM' */
   function timeFromFraction(f) {
-    var secs = Math.min(86399, Math.round(f * 86400));
-    return secs > 0 ? hms(Math.floor(secs / 3600), Math.floor(secs / 60) % 60, secs % 60 || null) : '';
+    var mins = Math.round(f * 1440);
+    if (mins >= 1440) mins = 1439;
+    return mins > 0 ? hm(Math.floor(mins / 60), mins % 60) : '';
   }
   /* 엑셀 날짜(일련번호 · Date · 글자) → { date:'YYYY-MM-DD', time:'HH:MM'|'' }. 못 읽으면 date ''.
      앱은 엑셀을 cellDates:false 로 읽어 날짜 칸이 일련번호로 옵니다(시간대 영향 없이 정확). */
@@ -104,9 +102,9 @@
     if (v == null || v === '') return out;
     if (v instanceof Date || Object.prototype.toString.call(v) === '[object Date]') {
       if (isNaN(v.getTime())) return out;
-      var d = new Date(v.getTime());
+      var d = new Date(Math.round(v.getTime() / 60000) * 60000);
       out.date = isoOk(d.getFullYear(), d.getMonth() + 1, d.getDate());
-      out.time = (d.getHours() || d.getMinutes() || d.getSeconds()) ? hms(d.getHours(), d.getMinutes(), d.getSeconds() || null) : '';
+      out.time = (d.getHours() || d.getMinutes()) ? hm(d.getHours(), d.getMinutes()) : '';
       return out;
     }
     if (typeof v === 'number') {
@@ -117,8 +115,8 @@
       return out;
     }
     var s = String(v).trim();
-    var m = /^(\d{4})[-./년\s]+(\d{1,2})[-./월\s]+(\d{1,2})일?(?:[T\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?/.exec(s);
-    if (m) { out.date = isoOk(+m[1], +m[2], +m[3]); if (out.date && m[4] != null) out.time = hms(+m[4], +m[5], m[6] == null ? null : +m[6]); return out; }
+    var m = /^(\d{4})[-./년\s]+(\d{1,2})[-./월\s]+(\d{1,2})일?(?:[T\s]+(\d{1,2}):(\d{2})(?::\d{2})?)?/.exec(s);
+    if (m) { out.date = isoOk(+m[1], +m[2], +m[3]); if (out.date && m[4] != null) out.time = hm(+m[4], +m[5]); return out; }
     m = /^(\d{4})(\d{2})(\d{2})$/.exec(s);
     if (m) { out.date = isoOk(+m[1], +m[2], +m[3]); return out; }
     if (/^\d{5}(\.\d+)?$/.test(s)) return toDateTime(Number(s));
@@ -129,8 +127,8 @@
   function toTime(v) {
     if (v == null || v === '') return '';
     if (typeof v === 'number') return v >= 0 && v < 1 ? timeFromFraction(v) : '';
-    var m = /^(\d{1,2}):(\d{2})(?::(\d{2}))?/.exec(String(v).trim());
-    return m ? hms(+m[1], +m[2], m[3] == null ? null : +m[3]) : '';
+    var m = /^(\d{1,2}):(\d{2})/.exec(String(v).trim());
+    return m ? hm(+m[1], +m[2]) : '';
   }
   function isoToUTC(iso) { var p = iso.split('-'); return Date.UTC(+p[0], +p[1] - 1, +p[2]); }
   function addDays(iso, n) { return isoFromUTC(isoToUTC(iso) + n * 86400000); }
@@ -193,17 +191,6 @@
       var fid = matchField(text);
       if (fid && out.map[fid] == null) { out.map[fid] = c3; out.units[fid] = splitHeader(text).unit; }
       else if (fid) out.warnings.push('「' + text + '」 열이 두 번 나옵니다. 앞의 것(' + colName(out.map[fid]) + ')을 씁니다.');
-    }
-    // 시각이 있는 센서 로그 양식의 「금형 타수」는 누적 카운터입니다.
-    // 기존 일별 로그는 행별 타수 해석을 유지합니다. 수동 열 연결은 아래에서 우선합니다.
-    if (out.map.strokes != null && splitHeader(out.headers[out.map.strokes]).key === '금형타수' &&
-        out.map.pressCum != null && out.map.dieCum == null && aoa.slice(best + 1).some(function (row) {
-          return toDateTime(row[out.map.date]).time || (out.map.time != null && toTime(row[out.map.time]));
-        })) {
-      out.map.dieCum = out.map.strokes;
-      out.units.dieCum = out.units.strokes;
-      delete out.map.strokes; delete out.units.strokes;
-      out.warnings.push('시각이 있는 프레스 로그의 「금형 타수」를 금형 누적 타수로 연결했습니다. 실제 타수는 누적값의 차이로 계산합니다.');
     }
     // 사용자가 고른 연결이 있으면 덮어씁니다 (값 -1 = 이 파일에는 없음)
     if (overrides) Object.keys(overrides).forEach(function (fid) {
@@ -280,7 +267,7 @@
 
   /* ── 5. 누적 · 중복 제거 ─────────────────────────────────────
      같은 행 = 일자 + 시각 + 프레스 + 금형. 다시 가져오면 새 값으로 바뀝니다. */
-  function recKey(r) { var t = r.time || ''; if (t.length === 5) t += ':00'; return [r.date, t, r.press, r.die || ''].join('|'); }
+  function recKey(r) { return [r.date, r.time || '', r.press, r.die || ''].join('|'); }
   function mergeRecords(existing, incoming) {
     var byKey = {}, stat = { added: 0, updated: 0 };
     (existing || []).forEach(function (r) { byKey[recKey(r)] = r; });
@@ -850,7 +837,7 @@
 
   /* ── 15. 저장 형식 ─────────────────────────────────────────── */
   function emptyDb() {
-    return { schemaVersion: SCHEMA_VERSION, records: [], files: [], presses: {}, dies: {}, rules: cleanRules({}), aiNotes: {}, aliases: { press: {}, die: {} }, maskNames: true, sample: false };
+    return { schemaVersion: SCHEMA_VERSION, records: [], files: [], presses: {}, dies: {}, rules: cleanRules({}), aiNotes: {}, aliases: { press: {}, die: {} }, maskNames: true, sample: false, spc: {}, rawFiles: [] };
   }
   function restoreDb(o) {
     var db = emptyDb();
@@ -867,6 +854,9 @@
     }
     if (o.maskNames === false) db.maskNames = false;
     db.sample = !!o.sample;
+    if (o.spc && typeof o.spc === 'object') db.spc = o.spc;
+    if (Array.isArray(o.rawFiles)) db.rawFiles = o.rawFiles;
+    if (o.sampleKind === 'raw') db.sampleKind = 'raw';
     return db;
   }
 

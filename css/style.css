@@ -2,7 +2,6 @@
    뼈대(짙은 남색 사이드바 + 밝은 본문)는 data09-25 에서, 대시보드(머리 띠·지표 4칸)는 data09-17 에서 가져왔습니다.
    360px 까지 반응형, 좁은 화면에서는 사이드바가 위쪽 메뉴로 바뀝니다. 그래프 색은 --series-* 변수. */
 :root {
-  /* 첨부된 HD현대 컬러 시스템의 RGB/HEX 기준값 */
   --hd-eco-green: #00e600;
   --hd-heritage-green: #00ad1d;
   --hd-prosperity-green: #008233;
@@ -28,7 +27,7 @@
   --fact: var(--hd-prosperity-green);
   --obs: #8a4b00;
   --radius: 10px;
-  --series-1: var(--hd-discovery-blue); /* 전류 · 첫 번째 종류 */
+  --series-1: var(--hd-discovery-blue); /* 전류 */
   --series-2: #d9601f;    /* 온도 */
   --series-3: var(--hd-prosperity-green); /* 진동 */
   --series-4: #7a55c7;    /* 전압 */
@@ -98,7 +97,7 @@ a { color: var(--primary); }
 .scope-chip {
   display: inline-flex; flex-wrap: wrap; gap: 2px 8px; align-items: center; min-width: 0; max-width: 100%;
   padding: 6px 14px; border-radius: 16px; background: var(--primary-soft); border: 1px solid #c3d6f3;
-  color: var(--hd-discovery-blue); font-weight: 700; font-size: .9rem; text-decoration: none;
+  color: #17427e; font-weight: 700; font-size: .9rem; text-decoration: none;
 }
 .scope-chip .dim { font-weight: 500; color: var(--muted); }
 .topbar-note { margin-left: auto; font-size: .85rem; color: var(--muted); }
@@ -258,9 +257,6 @@ svg.chart .axis { stroke: #b9c2ce; stroke-width: 1; }
 svg.chart .tick { fill: var(--muted); font-size: 12px; }
 svg.chart .ln { fill: none; stroke-width: 2; stroke-linejoin: round; }
 svg.chart .dot { stroke: var(--surface); stroke-width: 2; }
-/* 촘촘한 시계열에서 점의 흰 테두리가 센서 곡선을 덮지 않도록 합니다. */
-svg.chart.sensor-timed .dot { stroke: none; }
-svg.chart.sensor-timed .ln { stroke-width: 2; }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: .82rem; color: var(--muted); min-height: 4px; }
 .legend .lg { display: inline-flex; align-items: center; gap: 6px; }
 .legend i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
@@ -400,6 +396,39 @@ svg.chart .bar { opacity: .95; }
 .legend .sw-lim { background: repeating-linear-gradient(90deg, var(--lv-bad) 0 6px, transparent 6px 9px); height: 3px; }
 .legend .sw-warn { background: repeating-linear-gradient(90deg, var(--lv-warn-line) 0 2px, transparent 2px 5px); height: 3px; }
 .legend .sw-zone { background: #eef3fb; border: 1px solid #c9d6ea; }
+
+/* ── 2차: 실시간 관리도(2초 센서 로그) ── */
+.seg-sm { gap: 6px; }
+.seg-sm .btn.on, .seg-sm .btn[aria-pressed="true"] { background: var(--primary); border-color: var(--primary); color: var(--on-primary); font-weight: 700; }
+.spc-controls .field { margin-top: 12px; }
+.spc-controls .btn-row input[type="datetime-local"] { min-width: 0; max-width: 100%; }
+.progress { font-weight: 700; color: var(--primary-dark); }
+.lastcards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
+.lastcard { background: var(--surface); border: 1px solid var(--line); border-top: 4px solid var(--lv-none); border-radius: 12px; padding: 12px 14px; min-width: 0; }
+.lastcard.lv-ok { border-top-color: var(--lv-ok); } .lastcard.lv-warn { border-top-color: var(--lv-warn-line); } .lastcard.lv-bad { border-top-color: var(--lv-bad); }
+.lastcard .lc-top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 4px 8px; }
+.lastcard .k { font-weight: 800; }
+.lastcard .v { font-size: 1.5rem; font-weight: 800; font-variant-numeric: tabular-nums; }
+.lastcard .v small { font-size: .85rem; color: var(--muted); font-weight: 600; }
+.lastcard .note { font-size: .82rem; margin: 0; }
+.spc-charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-bottom: 16px; }
+.spc-charts .fig .note { font-size: .82rem; margin: 4px 0 0; }
+svg.chart .base-zone { fill: #eef3fb; }
+svg.chart .spc-ln { stroke-width: 1.2; }
+svg.chart .spc-band { stroke-width: 1; opacity: .28; fill: none; }
+svg.chart .viol { stroke: var(--surface); stroke-width: 1; }
+svg.chart .lim-label { font-size: 11px; }
+svg.chart .lim-label.bad { fill: var(--lv-bad); font-weight: 700; }
+.legend .sw-bad { background: var(--lv-bad); border-radius: 50%; }
+#spcRules .opt-grid { grid-template-columns: repeat(auto-fill, minmax(min(100%, 200px), 1fr)); }
+#spcRules .opt { min-width: 0; }
+.field .opt input[type="checkbox"] { width: 18px; height: 18px; flex: none; padding: 0; }
+ul.explain { padding-left: 1.2em; }
+ul.explain li { margin-bottom: 4px; }
+h2.sec .dp-more { font-size: .85rem; font-weight: 600; margin-left: 10px; }
+@media (max-width: 1100px) { .spc-charts { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 900px) { .lastcards { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 420px) { .lastcards { grid-template-columns: minmax(0, 1fr); } }
 
 /* 표가 넓은 화면에서 숫자 칸이 줄바꿈되지 않게, 좁은 화면은 표 안쪽 가로 스크롤 */
 table.list.dies td { white-space: nowrap; }

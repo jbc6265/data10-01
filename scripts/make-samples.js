@@ -37,3 +37,29 @@ for (const f of b.files) {
 }
 const r = L.dataRange(recs);
 console.log('누적 행', recs.length, '기간', r.first, '~', r.last);
+
+// ── 2차: 2초 센서 로그 샘플(수강생 로그와 같은 형식, 모든 칸 따옴표) ──
+// 10/21 오후(13:00~17:00) 4대 = 28,800행. P2 전류·온도 상승, P3 진동 튐, P4 전압 내려앉음이 이 구간에 들어 있습니다.
+// 앱과 같은 길(앞부분으로 2초 로그 판별 → 조각으로 나눠 읽기)로 다시 읽어 행 수·첫 행 값을 확인합니다.
+{
+  const P = require('../js/spc.js');
+  const name = '센서로그_샘플_2026-10-21.csv';
+  const lines = [Sample.rawCsvLine(Sample.RAW_HEAD)], first = [];
+  // 3일치 흐름(잡음 상태·누적 타수)을 그대로 이어 가려고 전체를 만들고 10/21 오후만 남깁니다
+  Sample.buildRaw(row => { if (row[0].startsWith('2026-10-21') && row[0].slice(11) >= '13:00:00') { if (!first.length) first.push(row); lines.push(Sample.rawCsvLine(row)); } });
+  const file = path.join(out, name);
+  fs.writeFileSync(file, '﻿' + lines.join('\r\n') + '\r\n', 'utf8');
+  const bytes = fs.readFileSync(file), text = new TextDecoder('utf-8').decode(bytes);
+  const head = P.parseCsvText(text.slice(0, 20000)); head.pop();
+  const det = L.detectColumns(head);
+  if (!P.isHighFreq(head, det).high) throw new Error(name + ' 2초 로그로 판별되지 않음');
+  const b = P.createRawBuilder(det); let n = 0;
+  const parser = P.createCsvParser(r => { if (n++ > det.headerRow) b.add(r, n); });
+  for (let i = 0; i < text.length; i += 1 << 20) parser.push(text.slice(i, i + (1 << 20)));
+  parser.end();
+  const res = b.finish();
+  if (res.rows !== lines.length - 1 || res.warnCount) throw new Error(name + ' 다시 읽기 행 수·알림 ' + res.rows + ' / ' + (lines.length - 1) + ' · ' + res.warnCount);
+  const s0 = res.series[first[0][1]];
+  if (P.stampText(s0.t[0]) !== first[0][0] || Math.abs(s0.current[0] - Number(first[0][6])) > 1e-3) throw new Error(name + ' 첫 행 값이 원본과 다름');
+  console.log(name, '행', res.rows, '·', (bytes.length / 1048576).toFixed(1) + 'MB', '· 프레스', Object.keys(res.series).join(','));
+}

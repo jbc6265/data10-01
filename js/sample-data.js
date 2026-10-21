@@ -1,7 +1,9 @@
 /* 가상 샘플 — 프레스 4대 × 90일 일일 로그 (전부 지어낸 값, 고정 씨앗 난수라 늘 같은 값)
    · 프레스 P1~P4, 금형 M-01~M-08(프레스마다 2개를 주마다 번갈아 씀), 일요일은 쉼·토요일은 반나절.
-   · 열 이름은 수강생이 「올릴 수 있는 샘플」로 적은 칸 그대로: 일자 · 프레스 · 프레스 종류 · 금형명 · 프레스 누적 타수 · 금형 타수 ·
-     가동 시간 · 전류 · 전압 · 온도 (+ 보유 데이터의 진동). 「금형 타수」 = 그 날 그 금형으로 친 횟수.
+   · 열 이름은 수강생이 「올릴 수 있는 샘플」로 적은 칸 그대로: 일자 · 프레스 · 프레스 종류 · 금형명 · 프레스 누적 타수 · 타수 ·
+     가동 시간 · 전류 · 전압 · 온도 (+ 보유 데이터의 진동). 「타수」 = 그 날 그 금형으로 친 횟수.
+     (2차: 수강생 로그에서 「금형 타수」가 교체 때 0 으로 돌아가는 누적 카운터로 확인되어, 일일 샘플의 하루 타수 칸 이름을 「타수」로 바꿈.
+      2초 센서 로그 샘플은 아래 buildRaw.)
    · 일부러 심어 둔 것 세 가지 — 대시보드에서 바로 보이게:
        ① 금형 M-05(P3) — 수명 기준 120,000타의 약 95% 사용, 교체 예정일이 2주 안 → 「주의」
        ② 프레스 P2 — 마지막 2주 동안 전류(+약 12%)·온도(+약 7℃)가 함께 서서히 오름 → 「점검 필요」
@@ -15,7 +17,7 @@
   'use strict';
 
   var START = '2026-07-21', DAYS = 90; // 2026-07-21 ~ 2026-10-18
-  var HEAD = ['일자', '프레스', '프레스 종류', '금형명', '프레스 누적 타수', '금형 타수', '가동 시간(h)', '전류(A)', '전압(V)', '온도(℃)', '진동(mm/s)'];
+  var HEAD = ['일자', '프레스', '프레스 종류', '금형명', '프레스 누적 타수', '타수', '가동 시간(h)', '전류(A)', '전압(V)', '온도(℃)', '진동(mm/s)'];
   var TITLE = '■ 프레스 일일 로그 (가상 샘플 — 실제 설비 값 아님)';
   var PRESSES = [
     { id: 'P1', type: '유압 프레스 800톤', dies: ['M-01', 'M-02'], strokes: 620, cur: 85, temp: 44, vib: 2.1, cum0: 1854200 },
@@ -128,5 +130,65 @@
     return { files: files, master: master(rows), rows: rows, start: START, end: addDays(START, DAYS - 1) };
   }
 
-  return { HEAD: HEAD, TITLE: TITLE, PRESSES: PRESSES, START: START, DAYS: DAYS, build: build, makeRows: makeRows, toCsv: toCsv, xlsxAoa: xlsxAoa, toSheet: toSheet, excelSerial: excelSerial };
+  /* ── 2초 센서 로그 샘플 (2차) ────────────────────────────────
+     수강생이 보낸 로그와 같은 형식(열 11개, 모든 칸 따옴표, 2초 간격, 10초에 1타). 값은 전부 지어낸 것입니다.
+     프레스 P1~P4 × 3일(10/19~10/21) × 08:00~12:00 · 13:00~17:00(점심 시간은 기록 없음) = 172,800행.
+     일부러 심어 둔 것:
+       ① P2 10/21 오후 — 전류가 13:00 부터 서서히 올라 ±3σ 관리선을 넘음(온도도 함께 오름)
+       ② P3 10/20 10:00~10:20 — 20분 정지(타수가 안 오르고 전류가 공회전 값으로 떨어짐)
+       ③ P3 10/21 14시대 — 진동이 몇 번 튐(1점 ±3σ 밖)
+       ④ P4 10/20 13:00 — 금형 M-07 → M-08 교체(금형 타수가 0 으로 돌아감)
+       ⑤ P4 10/21 13:00 부터 — 전압이 조금 내려앉음(±3σ 안쪽, 「연속 9점 한쪽」 규칙을 켜면 걸림)
+       ⑥ P1 10/20 15:10~15:25 — 기록 끊김(통신 끊김 가정)
+     buildRaw(onRow) 는 행(글자 배열)을 하나씩 넘깁니다. 머리행은 RAW_HEAD. */
+  var RAW_HEAD = ['일자', '프레스', '프레스 종류', '금형명', '프레스 누적 타수', '금형 타수', '전류(A)', '전압(V)', '온도(℃)', '진동(mm/s)', '데이터 구분'];
+  var RAW_DAYS = ['2026-10-19', '2026-10-20', '2026-10-21'];
+  var RAW_PRESS = [
+    { id: 'P1', type: '유압 프레스 800톤', die: 'M-01', cur: 85, volt: 381, temp: 43.5, vib: 2.02, pc0: 1890112, dc0: 0 },
+    { id: 'P2', type: '유압 프레스 800톤', die: 'M-03', cur: 92, volt: 380.5, temp: 45.2, vib: 2.25, pc0: 2264800, dc0: 41200 },
+    { id: 'P3', type: '기계식 프레스 400톤', die: 'M-05', cur: 58, volt: 380, temp: 41.3, vib: 3.05, pc0: 5221400, dc0: 108300 },
+    { id: 'P4', type: '유압 프레스 1500톤', die: 'M-07', die2: 'M-08', cur: 138, volt: 381.5, temp: 48.6, vib: 1.8, pc0: 1012900, dc0: 87650 }
+  ];
+  var RAW_SESSIONS = [[8 * 3600, 12 * 3600], [13 * 3600, 17 * 3600]];
+  function hhmmss(sec) { return pad(Math.floor(sec / 3600)) + ':' + pad(Math.floor(sec / 60) % 60) + ':' + pad(sec % 60); }
+  function buildRaw(onRow, opts) {
+    opts = opts || {};
+    var days = opts.days || RAW_DAYS, presses = opts.presses || RAW_PRESS.map(function (p) { return p.id; });
+    var sessions = opts.sessions || RAW_SESSIONS, label = opts.label || '가상 샘플', n = 0;
+    RAW_PRESS.filter(function (p) { return presses.indexOf(p.id) >= 0; }).forEach(function (p, pi) {
+      var rnd = mulberry32(20261021 + pi * 101);
+      function g() { var u = 0; for (var i = 0; i < 6; i++) u += rnd(); return Math.max(-3, Math.min(3, (u - 3) / Math.sqrt(0.5))); }
+      // 천천히 흔들리는 잡음(앞뒤 값이 비슷 — 수강생 로그처럼) + 2초마다 잡음, 온도는 근무 시작 뒤 조금 오름(예열)
+      var ar = { current: 0, temp: 0, vib: 0 }, PHI = { current: 0.995, temp: 0.998, vib: 0.99 }, SD = { current: 0.1, temp: 0.03, vib: 0.004 }, WH = { current: 0.75, temp: 0.09, vib: 0.038 };
+      var pc = p.pc0, dc = p.dc0, die = p.die;
+      // 시작 시점 잡음을 안정 상태에서
+      Object.keys(ar).forEach(function (k) { ar[k] = SD[k] * g(); });
+      days.forEach(function (day) {
+        if (RAW_DAYS.indexOf(day) < 0 && !opts.days) return;
+        sessions.forEach(function (ss) {
+          for (var sec = ss[0]; sec < ss[1]; sec += 2) {
+            var hm = sec / 3600;
+            if (p.id === 'P1' && day === '2026-10-20' && hm >= 15 + 10 / 60 && hm < 15 + 25 / 60) continue; // ⑥ 기록 끊김
+            if (p.id === 'P4' && day === '2026-10-20' && sec === 13 * 3600 && die !== p.die2) { die = p.die2; dc = 0; } // ④ 금형 교체
+            var stop = p.id === 'P3' && day === '2026-10-20' && hm >= 10 && hm < 10 + 20 / 60; // ② 정지
+            var sinceStart = (sec - ss[0]) / 60;
+            if (!stop && sec % 10 === 0 && sec > ss[0]) { pc++; dc++; }
+            Object.keys(ar).forEach(function (k) { ar[k] = PHI[k] * ar[k] + Math.sqrt(1 - PHI[k] * PHI[k]) * SD[k] * g(); });
+            var cur = p.cur + ar.current + WH.current * g(), temp = p.temp + ar.temp + WH.temp * g() + 0.3 * (1 - Math.exp(-sinceStart / 20)) - 0.15,
+              vib = p.vib + ar.vib + WH.vib * g(), volt = p.volt + 0.35 * g();
+            if (p.id === 'P2' && day === '2026-10-21' && hm >= 13) { var f = (hm - 13) / 4; cur += 7.5 * f; temp += 1.6 * f; } // ① 서서히 오름
+            if (stop) { cur = p.cur * 0.32 + 0.3 * g(); vib = 0.35 + 0.03 * g(); }
+            if (p.id === 'P3' && day === '2026-10-21' && hm >= 14 && hm < 15 && (sec % 337 === 0)) vib += 0.55 + 0.05 * g(); // ③ 진동 튐
+            if (p.id === 'P4' && day === '2026-10-21' && hm >= 13) volt -= 0.3; // ⑤ 전압 내려앉음
+            n++;
+            onRow([day + ' ' + hhmmss(sec), p.id, p.type, die, String(pc), String(dc), cur.toFixed(2), volt.toFixed(2), temp.toFixed(2), vib.toFixed(3), label]);
+          }
+        });
+      });
+    });
+    return n;
+  }
+  function rawCsvLine(cells) { return cells.map(function (c) { return '"' + String(c).replace(/"/g, '""') + '"'; }).join(','); }
+
+  return { HEAD: HEAD, TITLE: TITLE, PRESSES: PRESSES, START: START, DAYS: DAYS, build: build, makeRows: makeRows, buildRaw: buildRaw, RAW_HEAD: RAW_HEAD, RAW_DAYS: RAW_DAYS, RAW_PRESS: RAW_PRESS, rawCsvLine: rawCsvLine, toCsv: toCsv, xlsxAoa: xlsxAoa, toSheet: toSheet, excelSerial: excelSerial };
 });

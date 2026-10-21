@@ -2,9 +2,12 @@
    계산은 js/logic.js(PressLogic), 그래프는 js/charts.js, 저장은 js/store.js, AI 연결은 js/ai-endpoint.js·ai-panel.js. */
 (function () {
   'use strict';
-  var L = window.PressLogic, S = window.PressStore, C = window.PressCharts, AIP = window.AIPanel;
+  var L = window.PressLogic, S = window.PressStore, C = window.PressCharts, AIP = window.AIPanel, P = window.PressSPC, RS = window.PressRaw;
   var db = S.loadDb();
-  var ui = { press: '', month: '', pending: [], errors: [], progress: '' };
+  var ui = { press: '', month: '', pending: [], errors: [], progress: '', busy: false, spc: { press: '', die: -1, view: 'all', from: '', to: '', group: 0 } };
+  var raw = {};       // 2초 센서 로그 — 프레스마다 시계열(IndexedDB 에 저장, js/rawstore.js)
+  var rawInfo = {};   // 프레스마다 타수·정지 계산 캐시
+  var rawSaved = null; // true 저장됨 · false 저장 안 됨(메모리만)
   var main = document.getElementById('main');
   var A = null; // 지금 데이터의 분석 결과(render 마다 다시 계산)
 
@@ -87,7 +90,24 @@
   function goPress(id) { ui.press = id; location.hash = '#/anomaly'; }
 
   /* ── 가져오기 ───────────────────────────── */
+  /* CSV 는 앞부분(512KB)만 먼저 읽어 2초 로그인지 봅니다. 2초 로그면 반영할 때 조각으로 끝까지 읽고(큰 파일도 화면이 멈추지 않게),
+     아니면 지금처럼 통째로 읽습니다. */
+  var HEAD_BYTES = 512 * 1024, CHUNK_BYTES = 4 * 1024 * 1024;
   function readFile(file) {
+    if (!/\.(csv|txt)$/i.test(file.name)) return readWhole(file);
+    return file.slice(0, HEAD_BYTES).arrayBuffer().then(function (buf) {
+      var u8 = new Uint8Array(buf), enc = P.sniffEncoding(u8);
+      var text = new TextDecoder(enc).decode(u8);
+      var aoa = P.parseCsvText(text);
+      if (file.size > HEAD_BYTES && aoa.length > 1) aoa.pop(); // 잘린 마지막 행
+      var det = L.detectColumns(aoa), hf = P.isHighFreq(aoa, det);
+      if (!hf.high) return readWhole(file);
+      var it = { fileName: file.name, sheets: [{ name: 'CSV', aoa: aoa }], sheet: 'CSV', overrides: {}, file: file, previewOnly: true, encoding: enc === 'utf-8' ? 'UTF-8' : 'EUC-KR(CP949)', size: file.size };
+      reparse(it);
+      return it;
+    });
+  }
+  function readWhole(file) {
     return new Promise(function (resolve, reject) {
       var fr = new FileReader();
       fr.onload = function () {
@@ -115,6 +135,8 @@
     var sh = item.sheets.filter(function (s) { return s.name === item.sheet; })[0];
     item.aoa = sh ? sh.aoa : [];
     item.result = L.parseSheet(item.aoa, { fileName: item.fileName, overrides: item.overrides });
+    item.hf = P.isHighFreq(item.aoa, item.result.det);
+    item.raw = item.previewOnly ? true : item.hf.high;
   }
   function fileId(f) { return f.name + '|' + f.size + '|' + (f.lastModified || 0); }
   function handleFiles(list) {
@@ -135,6 +157,7 @@
       ui.progress = '읽는 중 ' + i + ' / ' + files.length + ' — ' + f.name;
       var pr = document.getElementById('importProgress'); if (pr) pr.textContent = ui.progress;
       readFile(f).then(function (it) {
+        if (!it.fileName) throw new Error(f.name + ': 읽지 못했습니다.');
         it.fid = fileId(f);
         it.already = db.files.some(function (x) { return x.name === f.name; });
         ui.pending.push(it);
@@ -150,25 +173,127 @@
   }
   function commit(items) {
     var total = { added: 0, updated: 0 }, ok = 0;
+    var rawItems = items.filter(function (it) { return it.raw && !it.result.det.missing.length; });
     items.forEach(function (it) {
       var r = it.result;
-      if (r.det.missing.length) return;
+      if (r.det.missing.length || it.raw) return;
       var m = L.mergeRecords(db.records, r.records);
       db.records = m.records;
       total.added += m.stat.added; total.updated += m.stat.updated;
       db.files.push({ name: it.fileName, sheet: it.sheet, rows: r.records.length, at: new Date().toISOString().slice(0, 16).replace('T', ' ') });
       ok++;
     });
-    var sm = L.syncMaster(db.presses, db.dies, db.records);
-    db.presses = sm.presses; db.dies = sm.dies;
-    db.sample = db.sample && items.every(function (it) { return it.sample; });
-    ui.pending = ui.pending.filter(function (p) { return items.indexOf(p) < 0; });
-    ui.errors = [];
-    save();
-    toast(ok + '개 파일 반영 — 새 행 ' + total.added + ' · 바뀐 행 ' + total.updated +
-      (sm.added.presses || sm.added.dies ? ' · 기준표에 프레스 ' + sm.added.presses + '대·금형 ' + sm.added.dies + '개 추가(설정에서 수명·주기를 넣어 주세요)' : ''));
-    render();
+    function finish(rawMsg) {
+      var sm = L.syncMaster(db.presses, db.dies, db.records);
+      db.presses = sm.presses; db.dies = sm.dies;
+      db.sample = db.sample && items.every(function (it) { return it.sample; });
+      ui.pending = ui.pending.filter(function (p) { return items.indexOf(p) < 0; });
+      ui.errors = [];
+      save();
+      toast((ok ? ok + '개 파일 반영 — 새 행 ' + total.added + ' · 바뀐 행 ' + total.updated : '') + (rawMsg ? (ok ? ' · ' : '') + rawMsg : '') +
+        (sm.added.presses || sm.added.dies ? ' · 기준표에 프레스 ' + sm.added.presses + '대·금형 ' + sm.added.dies + '개 추가(설정에서 수명·주기를 넣어 주세요)' : ''));
+      render();
+    }
+    if (!rawItems.length) { finish(''); return Promise.resolve(); }
+    ui.busy = true; render();
+    return readRawItems(rawItems).then(function (st) {
+      ui.busy = false; ui.progress = '';
+      finish('2초 로그 ' + rawItems.length + '개 파일 ' + L.fmtN(st.rows) + '행 → 프레스 ' + st.presses.join(', ') + (st.replaced ? ' (같은 시각 ' + L.fmtN(st.replaced) + '행은 새 값으로)' : '') + (st.warnCount ? ' · 행 점검 알림 ' + L.fmtN(st.warnCount) + '건' : ''));
+      if (location.hash !== '#/spc' && !items.some(function (it) { return it.sample; })) location.hash = '#/spc';
+    }, function (e) {
+      ui.busy = false; ui.progress = '';
+      ui.errors.push(e.message || String(e)); toast('2초 로그를 반영하지 못했습니다: ' + (e.message || e), true); render();
+    });
   }
+
+  /* ── 2초 로그 반영 ─────────────────────── */
+  function setProgress(t) { ui.progress = t; var pr = document.getElementById('importProgress'); if (pr) pr.textContent = t; }
+  function tick() { return new Promise(function (r) { setTimeout(r, 0); }); }
+  /* 파일마다 조각으로 읽어 행 → 프레스별 시계열 → 이미 있는 것과 합치기 → 일 집계를 기존 판정으로 */
+  function readRawItems(items) {
+    var stat = { rows: 0, replaced: 0, warnCount: 0, presses: [] }, touched = {};
+    var chain = Promise.resolve();
+    items.forEach(function (it, idx) {
+      chain = chain.then(function () {
+        var b = P.createRawBuilder(it.result.det), det = it.result.det, label = '(' + (idx + 1) + '/' + items.length + ') ' + it.fileName;
+        var work;
+        if (it.previewOnly && it.file) {
+          var pos = 0, rowNo = 0, dec = new TextDecoder(it.encoding === 'UTF-8' ? 'utf-8' : 'euc-kr'), started = Date.now();
+          var parser = P.createCsvParser(function (row) { rowNo++; if (rowNo - 1 > det.headerRow) b.add(row, rowNo); });
+          work = (function next() {
+            if (pos >= it.file.size) { parser.push(dec.decode()); parser.end(); return Promise.resolve(); }
+            return it.file.slice(pos, pos + CHUNK_BYTES).arrayBuffer().then(function (buf) {
+              pos += buf.byteLength;
+              parser.push(dec.decode(new Uint8Array(buf), { stream: true }));
+              setProgress('읽는 중 ' + label + ' — ' + Math.round(pos / it.file.size * 100) + '% · ' + L.fmtN(b.result.rows) + '행' + (Date.now() - started > 1500 ? ' · ' + Math.round((Date.now() - started) / 1000) + '초' : ''));
+              return tick().then(next);
+            });
+          })();
+        } else {
+          var aoa = it.aoa, r = det.headerRow + 1;
+          work = (function next() {
+            var end = Math.min(aoa.length, r + 20000);
+            for (; r < end; r++) b.add(aoa[r], r + 1);
+            setProgress('읽는 중 ' + label + ' — ' + Math.round(r / aoa.length * 100) + '%');
+            return r < aoa.length ? tick().then(next) : Promise.resolve();
+          })();
+        }
+        return work.then(function () {
+          setProgress('합치는 중 ' + label);
+          var res = b.finish();
+          stat.rows += res.rows; stat.warnCount += res.warnCount;
+          if (res.warnings.length) ui.rawWarnings = res.warnings;
+          Object.keys(res.series).forEach(function (p) {
+            var m = P.mergeSeries(raw[p], res.series[p]);
+            stat.replaced += m.replaced || 0; raw[p] = m; touched[p] = 1; delete rawInfo[p];
+          });
+          db.rawFiles = (db.rawFiles || []).concat([{ name: it.fileName, rows: res.rows, skipped: res.skipped, presses: Object.keys(res.series).sort(L.natCmp).join(', '),
+            from: P.stampText(res.first), to: P.stampText(res.last), at: new Date().toISOString().slice(0, 16).replace('T', ' ') }]);
+          return tick();
+        });
+      });
+    });
+    return chain.then(function () {
+      stat.presses = Object.keys(touched).sort(L.natCmp);
+      setProgress('일 집계 만드는 중');
+      rebuildDaily(stat.presses);
+      return saveRaw(stat.presses).then(function () { return stat; });
+    });
+  }
+  function infoOf(p) {
+    var O = P.cleanOpts(db.spc), key = raw[p].n + '|' + O.cycleSec + '|' + O.stopSec + '|' + O.gapSec;
+    if (!rawInfo[p] || rawInfo[p].key !== key) { rawInfo[p] = P.strokeInfo(raw[p], O); rawInfo[p].key = key; }
+    return rawInfo[p];
+  }
+  /* 원 로그 → 하루 묶음(프레스·날짜·금형) — 기존 금형·오버홀·「최근 14일 vs 앞 42일」 판정이 이어서 씁니다 */
+  function rebuildDaily(presses) {
+    presses.forEach(function (p) {
+      db.records = db.records.filter(function (r) { return !(r.src === 'raw' && r.press === p); });
+      if (!raw[p]) return;
+      db.records = L.mergeRecords(db.records, P.dailyFromSeries(raw[p], infoOf(p))).records;
+    });
+  }
+  function saveRaw(presses) {
+    var m = {}; presses.forEach(function (p) { if (raw[p]) m[p] = raw[p]; });
+    return RS.save(m).then(function (ok) { rawSaved = ok; });
+  }
+  function rawRows() { return Object.keys(raw).reduce(function (s, p) { return s + raw[p].n; }, 0); }
+  function clearRaw() { raw = {}; rawInfo = {}; db.rawFiles = []; return RS.clear(); }
+  function loadRawSample() {
+    toast('2초 로그 샘플을 만드는 중입니다(4대 × 3일, 172,350행)…');
+    ui.busy = true; render();
+    setTimeout(function () {
+      var det = L.detectColumns([window.PressSample.RAW_HEAD]);
+      var it = { fileName: '센서로그_샘플_2026-10-19~21 (2초)', result: { det: det, records: [], warnings: [] }, raw: true, sample: true, aoa: [window.PressSample.RAW_HEAD] };
+      window.PressSample.buildRaw(function (row) { it.aoa.push(row); });
+      clearRaw().then(function () {
+        db = L.emptyDb(); db.sample = true; db.sampleKind = 'raw';
+        ui.pending = []; ui.press = ''; ui.month = ''; ui.spc = { press: '', die: -1, view: 'all', from: '', to: '', group: 0 };
+        return commit([it]);
+      }).then(function () { location.hash = '#/spc'; });
+    }, 30);
+  }
+  function askRawSample() { if ((!db.records.length && !rawRows()) || confirm('지금 데이터를 지우고 2초 로그 샘플(프레스 4대 × 3일)을 불러올까요?')) loadRawSample(); }
   function sampleItems() {
     var b = window.PressSample.build();
     var items = b.files.map(function (f) {
@@ -186,6 +311,7 @@
   }
   function loadSample() {
     var s = sampleItems();
+    clearRaw();
     db = L.emptyDb(); db.sample = true;
     db.presses = s.master.presses; db.dies = s.master.dies;
     ui.pending = []; ui.press = ''; ui.month = '';
@@ -211,15 +337,18 @@
       h('section', { class: 'card' }, h('h2', null, '1. 파일 넣기'), drop,
         h('div', { class: 'btn-row' },
           h('button', { type: 'button', class: 'btn', onclick: askSample }, '샘플 90일로 시작'),
+          h('button', { type: 'button', class: 'btn', onclick: askRawSample }, '2초 로그 샘플(4대 × 3일)'),
+          h('a', { class: 'btn', href: 'samples/' + encodeURIComponent('센서로그_샘플_2026-10-21.csv'), download: '' }, '2초 로그 샘플 CSV 내려받기'),
           h('a', { class: 'btn', href: 'samples/' + encodeURIComponent('프레스로그_샘플_2026-09.xlsx'), download: '' }, '샘플 엑셀 내려받기(9월)'),
           h('a', { class: 'btn', href: 'samples/' + encodeURIComponent('프레스로그_샘플_2026-10.csv'), download: '' }, '샘플 CSV 내려받기(10월)')),
         h('ul', { class: 'note' },
           h('li', null, '한 행 = 한 프레스의 한 기록(하루 또는 시각별)입니다. 꼭 필요한 열은 일자와 프레스이고, 나머지(프레스 종류·금형명·타수·누적 타수·가동 시간·전류·전압·온도·진동)는 있는 만큼 씁니다.'),
-          h('li', null, '타수는 「타수」 열이 있으면 그 값을, 없으면 「프레스 누적 타수」 차이, 그것도 없으면 「금형 누적 타수」 차이를 씁니다. 시각과 프레스 누적 타수가 있는 로그의 「금형 타수」는 누적값으로 자동 연결합니다. 일별 로그에서는 행별 횟수로 읽으며 열 연결에서 변경할 수 있습니다. 초 단위 시각을 지원하고 가동 시간은 생략할 수 있습니다.'),
+          h('li', null, '2초 간격 센서 로그(일자에 초까지, 예: 2026-10-01 09:00:02)는 알아서 가려 「실시간 관리도」로 보냅니다. 큰 CSV(하루 43,200행 × 프레스 여러 대)도 조각으로 나눠 읽어 화면이 멈추지 않습니다. 같은 프레스·같은 시각은 한 번만 셉니다.'),
+          h('li', null, '타수는 「타수」 열이 있으면 그 값을, 없으면 같은 프레스의 「프레스 누적 타수」 차이를, 그것도 없으면 「금형 (누적) 타수」 차이를 씁니다. 「금형 타수」 열은 금형 교체 때 0 으로 돌아가는 누적 카운터로 읽습니다(받은 로그 확인).'),
           h('li', null, '같은 행(일자 + 시각 + 프레스 + 금형)을 다시 가져오면 새 값으로 바뀝니다. 같은 파일을 두 번 넣어도 두 번 세지 않습니다.'),
           h('li', null, 'CSV 는 UTF-8 과 한글 엑셀이 저장한 CP949(EUC-KR) 를 알아서 가려 읽습니다.'),
           h('li', null, '파일은 서버로 보내지 않고 이 브라우저 안에서만 읽습니다.')),
-        h('p', { class: 'note', id: 'importProgress', 'aria-live': 'polite' }, ui.progress || ''),
+        h('p', { class: 'note progress', id: 'importProgress', 'aria-live': 'polite' }, ui.progress || ''),
         ui.errors.length ? h('details', { class: 'warn-list', open: true }, h('summary', null, '읽지 못했거나 건너뛴 파일 ' + ui.errors.length + '개'),
           h('ul', null, ui.errors.map(function (e) { return h('li', null, e); }))) : null)];
 
@@ -229,19 +358,34 @@
       box.appendChild(table(['파일', '기간', '행', '프레스', '알림', '상태'], ui.pending.map(function (it) {
         var r = it.result, rg = L.dataRange(r.records);
         var presses = []; r.records.forEach(function (x) { if (presses.indexOf(x.press) < 0) presses.push(x.press); });
+        var rows = it.previewOnly ? '앞부분 ' + r.records.length + '행 미리 봄 · 전체 ' + (it.size / 1048576).toFixed(1) + 'MB' : r.records.length;
         return { cls: r.det.missing.length ? 'excluded' : null, cells: [it.fileName + (it.encoding ? ' (' + it.encoding + ')' : ''),
-          rg.first ? rg.first + ' ~ ' + rg.last : '-', r.records.length, presses.sort(L.natCmp).join(', ') || '-', r.warnings.length + r.det.warnings.length,
-          r.det.missing.length ? '열 연결 필요' : it.already ? '이전에 가져온 파일(새 값으로 바뀜)' : '반영 준비됨'] };
-      }), { num: [0, 0, 1, 0, 1, 0] }));
+          rg.first ? rg.first + ' ~ ' + rg.last + (it.previewOnly ? ' …' : '') : '-', rows, presses.sort(L.natCmp).join(', ') || '-', r.warnings.length + r.det.warnings.length,
+          r.det.missing.length ? '열 연결 필요' : it.raw ? '2초 센서 로그(' + (it.hf.reason || '고빈도') + ') → 실시간 관리도' : it.already ? '이전에 가져온 파일(새 값으로 바뀜)' : '반영 준비됨'] };
+      }), { num: [0, 0, 0, 0, 1, 0] }));
       box.appendChild(h('h3', null, '파일별 자세히'));
       ui.pending.forEach(function (it) { box.appendChild(pendingCard(it)); });
       box.appendChild(h('div', { class: 'btn-row' },
-        h('button', { type: 'button', class: 'btn btn-primary', disabled: !ready.length, onclick: function () { commit(ready); } }, '확인한 ' + ready.length + '개 파일 반영'),
+        h('button', { type: 'button', class: 'btn btn-primary', disabled: !ready.length || ui.busy, onclick: function () { commit(ready); } }, ui.busy ? '읽는 중…' : '확인한 ' + ready.length + '개 파일 반영'),
         h('button', { type: 'button', class: 'btn', onclick: function () { ui.pending = []; render(); } }, '취소')));
       out.push(box);
     }
 
     var presses = Object.keys(db.presses), st = A.strokeStat;
+    var rawPs = Object.keys(raw).sort(L.natCmp);
+    if (rawPs.length) out.push(h('section', { class: 'card' }, h('h2', null, '쌓인 2초 센서 로그'),
+      table(['프레스', '종류', '기간', '행', '날 수', '금형'], rawPs.map(function (p) { var m = P.summary(raw[p]); return [p, m.type || '-', P.stampText(m.from) + ' ~ ' + P.stampText(m.to), N(m.n), m.days, m.dies.join(', ') || '-']; }), { num: [0, 0, 0, 1, 1, 0] }),
+      h('p', { class: 'note' }, rawSaved === false ? '이 브라우저 저장소(IndexedDB)가 막혀 이번 창에만 있습니다. 창을 닫으면 사라집니다.' : '이 브라우저(IndexedDB)에 저장됩니다. 하루 묶음(타수·가동 시간·센서 평균)은 아래 「쌓인 데이터」로 이어져 금형·오버홀·일 단위 이상 감지에 쓰입니다.'),
+      ui.rawWarnings && ui.rawWarnings.length ? h('details', { class: 'warn-list' }, h('summary', null, '마지막으로 읽은 파일의 행 점검 알림(앞 50건)'),
+        h('ul', null, ui.rawWarnings.map(function (w) { return h('li', null, (w.row ? w.row + '행: ' : '') + w.msg); }))) : null,
+      (db.rawFiles || []).length ? h('details', null, h('summary', null, '가져온 2초 로그 파일 ' + db.rawFiles.length + '개'),
+        table(['파일', '프레스', '처음', '끝', '행', '가져온 때'], db.rawFiles.slice().reverse().map(function (f) { return [f.name, f.presses, f.from, f.to, N(f.rows), f.at]; }), { num: [0, 0, 0, 0, 1, 0] })) : null,
+      h('div', { class: 'btn-row', style: 'margin-top:12px' },
+        h('a', { class: 'btn btn-primary', href: '#/spc' }, '실시간 관리도 보기'),
+        h('button', { type: 'button', class: 'btn', onclick: function () {
+          if (!confirm('2초 센서 로그와 거기서 만든 하루 묶음만 지울까요?')) return;
+          clearRaw().then(function () { db.records = db.records.filter(function (r) { return r.src !== 'raw'; }); save(); render(); });
+        } }, '2초 로그만 지우기'))));
     out.push(h('section', { class: 'card' }, h('h2', null, '쌓인 데이터'),
       db.records.length ? h('div', null,
         h('div', { class: 'tiles' },
@@ -258,11 +402,11 @@
         h('div', { class: 'btn-row', style: 'margin-top:12px' },
           h('button', { type: 'button', class: 'btn btn-danger', onclick: function () {
             if (!confirm('이 브라우저에 쌓인 로그·기준표·설정을 모두 지울까요? (되돌릴 수 없습니다. 먼저 설정 화면에서 JSON 백업을 받아 두면 안전합니다)')) return;
-            db = L.emptyDb(); S.clearDb(); ui.press = ''; ui.month = ''; save(); render();
+            db = L.emptyDb(); S.clearDb(); ui.press = ''; ui.month = ''; clearRaw(); save(); render();
           } }, '모든 데이터 지우기'),
           h('button', { type: 'button', class: 'btn', onclick: function () {
             if (!confirm('로그만 지우고 설비·금형 기준표와 설정은 남길까요?')) return;
-            db.records = []; db.files = []; db.sample = false; save(); render();
+            db.records = []; db.files = []; db.sample = false; clearRaw(); save(); render();
           } }, '로그만 지우기')))
         : h('p', { class: 'note' }, '아직 없습니다.')));
     return out;
@@ -341,7 +485,7 @@
       sched.length ? table(['예정일', '구분', '대상', '상태'], sched.map(function (x) {
         return { cells: [x.date + (x.date < A.asOf ? ' (지남)' : x.date === A.asOf ? ' (오늘)' : ' (' + L.daysBetween(A.asOf, x.date) + '일 뒤)'), x.kind, x.target, pill(x.level)] };
       }), { cls: 'dash-table' }) : h('p', { class: 'note' }, '45일 안에 예정된 금형 교체·오버홀이 없습니다.'));
-    return [hero, kpis, h('h2', { class: 'sec' }, '프레스별 상태'), cards, h('div', { class: 'grid-2' }, dieBox, schedBox)];
+    return [hero, kpis, rawDash(), h('h2', { class: 'sec' }, '프레스별 상태 (하루 묶음 기준)'), cards, h('div', { class: 'grid-2' }, dieBox, schedBox)];
   }
   function dk(t, v, unit, cls, note) {
     return h('div', { class: 'dk ' + cls }, h('div', { class: 'dk-body' }, h('div', { class: 'dk-t' }, t), h('div', { class: 'dk-v' }, String(v), h('small', null, unit)), h('div', { class: 'dk-note' }, note)));
@@ -371,6 +515,223 @@
     A.dies.forEach(function (d) { if (d.dueDate && d.dueDate <= until) out.push({ date: d.dueDate, kind: '금형 교체', target: d.id + (d.presses.length ? ' (' + d.presses.join('·') + ')' : ''), level: d.level }); });
     A.overhauls.forEach(function (o) { if (o.dueDate && o.dueDate <= until) out.push({ date: o.dueDate, kind: '오버홀', target: o.id + (o.type ? ' · ' + o.type : ''), level: o.level }); });
     return out.sort(function (a, b) { return a.date < b.date ? -1 : a.date > b.date ? 1 : 0; });
+  }
+
+
+  /* ── 실시간 관리도 (2초 센서 로그) ─────────── */
+  var CH_META = { current: { label: '전류', unit: 'A', color: 'var(--series-1)' }, voltage: { label: '전압', unit: 'V', color: 'var(--series-4)' },
+    temp: { label: '온도', unit: '℃', color: 'var(--series-2)' }, vib: { label: '진동', unit: 'mm/s', color: 'var(--series-3)' } };
+  var VIEWS = [['all', '전체'], [10, '최근 10분'], [30, '최근 30분'], [60, '최근 1시간'], [240, '최근 4시간'], [1440, '최근 하루'], ['custom', '기간 지정']];
+  function spcWindow(s) {
+    var last = s.t[s.n - 1], first = s.t[0], v = ui.spc.view;
+    if (v === 'custom') {
+      var a = P.fromLocalInput(ui.spc.from), b = P.fromLocalInput(ui.spc.to);
+      return { from: isFinite(a) ? a : first, to: isFinite(b) ? b : last };
+    }
+    if (typeof v === 'number') return { from: Math.max(first, last - v * 60), to: last };
+    return { from: first, to: last };
+  }
+  function chansOf(s) { return P.CH.filter(function (c) { var v = s[c]; for (var i = 0; i < v.length; i += Math.max(1, Math.floor(v.length / 200))) if (!isNaN(v[i])) return true; return false; }); }
+  function emptyRaw(title) {
+    return [pageHead('실시간', title || '실시간 관리도'), h('section', { class: 'card empty' },
+      h('p', null, '아직 2초 센서 로그가 없습니다.'),
+      h('p', null, '「데이터 가져오기」에서 설비가 2초마다 보낸 로그 CSV 를 넣거나, 2초 로그 샘플(프레스 4대 × 3일)로 둘러봐 주세요.'),
+      h('div', { class: 'btn-row', style: 'justify-content:center' },
+        h('a', { class: 'btn btn-primary', href: '#/import' }, '데이터 가져오기로'),
+        h('button', { type: 'button', class: 'btn', onclick: askRawSample }, '2초 로그 샘플로 시작')))];
+  }
+  function pageSpc() {
+    var presses = Object.keys(raw).sort(L.natCmp);
+    if (!presses.length) return emptyRaw();
+    if (presses.indexOf(ui.spc.press) < 0) { ui.spc.press = presses[0]; ui.spc.die = -1; }
+    var s = raw[ui.spc.press], info = infoOf(ui.spc.press), O = P.cleanOpts(db.spc), win = spcWindow(s);
+    var view = { from: win.from, to: win.to, dieIdx: ui.spc.die, groupSec: ui.spc.group };
+    var chans = chansOf(s);
+    var charts = chans.map(function (c) { return P.chartData(s, info, c, O, view); });
+
+    // 고르기
+    var pSel = h('select', { 'aria-label': '프레스' }, presses.map(function (p) { return h('option', { value: p, selected: p === ui.spc.press }, p + (raw[p].type ? ' · ' + raw[p].type : '')); }));
+    pSel.addEventListener('change', function () { ui.spc.press = pSel.value; ui.spc.die = -1; render(); });
+    var dSel = h('select', { 'aria-label': '금형' }, h('option', { value: '-1' }, '전체 금형'), s.dies.map(function (d, i) { return d ? h('option', { value: String(i), selected: i === ui.spc.die }, d) : null; }));
+    dSel.addEventListener('change', function () { ui.spc.die = Number(dSel.value); render(); });
+    var gSel = h('select', { 'aria-label': '묶어 보기' }, [[0, '2초 원값(받은 그대로)'], [60, '1분 평균'], [300, '5분 평균']].map(function (x) { return h('option', { value: String(x[0]), selected: x[0] === ui.spc.group }, x[1]); }));
+    gSel.addEventListener('change', function () { ui.spc.group = Number(gSel.value); render(); });
+    var seg = h('div', { class: 'seg seg-sm' }, VIEWS.map(function (v) {
+      return h('button', { type: 'button', class: 'btn btn-sm' + (ui.spc.view === v[0] ? ' on' : ''), 'aria-pressed': ui.spc.view === v[0] ? 'true' : 'false', onclick: function () {
+        ui.spc.view = v[0];
+        if (v[0] === 'custom' && !ui.spc.from) { ui.spc.from = P.toLocalInput(win.from); ui.spc.to = P.toLocalInput(win.to); }
+        render();
+      } }, v[1]);
+    }));
+    var custom = null;
+    if (ui.spc.view === 'custom') {
+      var fIn = h('input', { type: 'datetime-local', step: 1, value: ui.spc.from, 'aria-label': '시작' }), tIn = h('input', { type: 'datetime-local', step: 1, value: ui.spc.to, 'aria-label': '끝' });
+      custom = h('div', { class: 'btn-row' }, fIn, h('span', { class: 'note' }, '~'), tIn, h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { ui.spc.from = fIn.value; ui.spc.to = tIn.value; render(); } }, '보기'));
+    }
+    var controls = h('section', { class: 'card spc-controls' },
+      h('div', { class: 'form-grid' }, fld('프레스', pSel), fld('금형', dSel, s.dies.filter(Boolean).length > 1 ? '금형을 고르면 그 금형으로 친 때의 값만 보고, 관리 한계도 그 값으로 잡습니다.' : null),
+        fld('묶어 보기', gSel, '2초 값은 정상이어도 370개에 1개꼴(약 12분에 한 번) 우연히 ±3σ 를 넘습니다. 1분 평균으로 묶으면 우연한 이탈이 줄고 서서히 바뀌는 것이 잘 보입니다.')),
+      h('div', { class: 'field' }, h('span', null, '보는 구간'), seg), custom,
+      h('p', { class: 'note' }, '로그 ' + P.stampText(s.t[0]) + ' ~ ' + P.stampText(s.t[s.n - 1]) + ' · ' + N(s.n) + '행 · 지금 보는 구간 ' + P.stampText(win.from) + ' ~ ' + P.stampText(win.to) +
+        ' · 「최근 N분」은 로그 마지막 시각 기준입니다(새 파일을 넣으면 따라갑니다).'));
+
+    // 마지막 값 카드
+    var lastCards = h('div', { class: 'lastcards' }, charts.map(function (d) {
+      var m = CH_META[d.channel], lv = 'none', st = '기준 없음';
+      if (d.lim && d.last) {
+        var v = d.last.v;
+        if (v > d.lim.ucl || v < d.lim.lcl) { lv = 'bad'; st = '관리선 밖'; }
+        else if (v > d.lim.uwl || v < d.lim.lwl) { lv = 'warn'; st = '경고선 밖'; }
+        else { lv = 'ok'; st = '관리선 안'; }
+      }
+      var ev = d.events.length;
+      return h('div', { class: 'lastcard lv-' + lv },
+        h('div', { class: 'lc-top' }, h('span', { class: 'k' }, m.label), h('span', { class: 'pill lv-' + lv }, st)),
+        h('div', { class: 'v' }, d.last ? fmt(d.last.v) : '-', h('small', null, ' ' + m.unit)),
+        h('div', { class: 'note' }, d.last ? P.stampText(d.last.t, 'md') + ':' + P.stampText(d.last.t, 'time').slice(6) : ''),
+        d.lim ? h('div', { class: 'note' }, '중심선 ' + fmt(d.lim.center) + ' · 관리선 ' + fmt(d.lim.lcl) + ' ~ ' + fmt(d.lim.ucl)) : null,
+        h('div', { class: 'note' }, '이 구간 이탈 ' + (ev ? ev + '번(' + N(d.count.r1 + d.count.run9 + d.count.trend6 + d.count.two3) + '점)' : '없음')));
+    }));
+
+    // 관리도
+    var figs = h('div', { class: 'spc-charts' }, charts.map(function (d) {
+      var m = CH_META[d.channel];
+      var ds = P.downsample(d.cs.t, d.values, d.flags, d.i0, 600, 2000);
+      var cap = m.label + ' (' + m.unit + ')' + (ui.spc.group ? ' — ' + (ui.spc.group / 60) + '분 평균' : '') + (d.lim ? ' · σ ' + fmt(d.lim.sigma, 4) + (d.lim.method === 'mr' ? ' (MR̄/1.128)' : ' (표본 표준편차)') : ' · 기준 구간 값이 모자라 관리선을 못 그림');
+      var f = C.spcFigure(cap, { ds: ds, lim: d.lim, base: d.base, from: win.from, to: win.to, warn: O.warnLines, unit: m.unit, color: m.color, gapSec: Math.max(O.gapSec, ui.spc.group * 3) });
+      if (ds.violCount > ds.viol.length) f.appendChild(h('p', { class: 'note' }, '이탈점이 ' + N(ds.violCount) + '개라 그래프에는 칸마다 가장 먼 점만 그렸습니다. 전부는 아래 목록·엑셀에 있습니다.'));
+      if (!ds.raw) f.appendChild(h('p', { class: 'note' }, N(d.values.length) + '점을 ' + ds.buckets.length + '칸으로 줄여 그림(칸마다 평균·최소·최대) — 이탈점은 줄이지 않고 모두 빨간 점으로 표시. 구간을 좁히면 원값이 그대로 보입니다.'));
+      return f;
+    }));
+
+    // 타수
+    var r = P.rangeIdx(s, win.from, win.to), w = P.strokeWindow(s, info, r[0], r[1]);
+    var stroke = h('section', { class: 'card' }, h('h2', null, '타수 · 가동률 · 정지'),
+      info.counted ? [
+        h('div', { class: 'tiles' },
+          tile('타수', N(w.strokes) + '타', '시간당 ' + N(w.perHour, 0) + '타 (' + info.source + ' 차이)'),
+          tile('기준 대비', L.pctText(w.perf), O.cycleSec + '초에 1타 = 시간당 ' + N(3600 / O.cycleSec) + '타 기준'),
+          tile('시간 가동률', L.pctText(w.availability), '기록된 ' + P.durText(w.coveredSec) + ' 중 가동 ' + P.durText(w.runSec)),
+          tile('정지', w.stops.length + '번', w.stops.length ? '합 ' + P.durText(w.stops.reduce(function (a, x) { return a + x.sec; }, 0)) : O.stopSec + '초 넘게 타수가 안 오른 때'),
+          tile('마지막 타수 뒤', isFinite(w.sinceStroke) ? P.durText(w.sinceStroke) : '-', isFinite(w.sinceStroke) && w.sinceStroke > O.stopSec ? '정지 중으로 보임' : '가동 중'),
+          tile('금형 리셋(교체)', w.resets.length + '번', w.resets.length ? w.resets.map(function (x) { return x.fromDie + '→' + x.toDie; }).join(', ') : '금형 타수가 0 으로 돌아간 때')),
+        hourFig(w, O),
+        w.stops.length ? h('details', { open: w.stops.length <= 8 ? true : null }, h('summary', null, '정지 구간 ' + w.stops.length + '번'),
+          table(['시작', '끝', '길이', ''], w.stops.slice(-200).reverse().map(function (x) { return [P.stampText(x.from), P.stampText(x.to), P.durText(x.sec), x.open ? '진행 중' : '']; }))) : null,
+        w.resets.length ? h('details', { open: true }, h('summary', null, '금형 리셋(교체) 감지 ' + w.resets.length + '번'),
+          table(['시각', '바뀌기 전', '바뀐 뒤', '바뀌기 전 금형 타수', '알아낸 방법'], w.resets.map(function (x) { return [P.stampText(x.t), x.fromDie || '-', x.toDie || '-', isFinite(x.before) ? N(x.before) : '-', x.kind]; }))) : null,
+        w.gaps.length ? h('details', null, h('summary', null, '기록 끊김 ' + w.gaps.length + '번 (' + O.gapSec + '초 넘게 기록이 없던 때 — 쉬는 시간·근무 외 포함)'),
+          table(['끊긴 때', '다시 들어온 때', '길이'], w.gaps.slice(-200).reverse().map(function (x) { return [P.stampText(x.from), P.stampText(x.to), P.durText(x.sec)]; }))) : null
+      ] : h('p', { class: 'note' }, '이 로그에는 프레스 누적 타수·금형 타수가 없어 타수를 셀 수 없습니다.'));
+
+    // 이탈 목록
+    var evs = [];
+    charts.forEach(function (d) { d.events.forEach(function (e) { evs.push({ ch: d.channel, e: e, lim: d.lim }); }); });
+    evs.sort(function (a, b) { return b.e.from - a.e.from; });
+    var evBox = h('section', { class: 'card' }, h('h2', null, '이탈 목록 (' + N(evs.length) + '번)'),
+      h('p', { class: 'note' }, '바로 이어진 이탈점은 한 번으로 묶었습니다. 최근 것부터 · 화면에는 300번까지, 엑셀에는 전부.'),
+      evs.length ? table(['채널', '시작', '끝', '점 수', '규칙', '가장 먼 값', '중심선에서', '방향'], evs.slice(0, 300).map(function (x) {
+        var m = CH_META[x.ch];
+        return { cls: 'lv-row', cells: [m.label, P.stampText(x.e.from), x.e.to > x.e.from ? P.stampText(x.e.to, 'time') : '', N(x.e.n), x.e.rules.join(', '), fmt(x.e.peak) + ' ' + m.unit, (x.e.z > 0 ? '+' : '') + fmt(x.e.z, 1) + 'σ', x.e.side === 'up' ? '높음' : '낮음'] };
+      }), { num: [0, 0, 0, 1, 0, 1, 1, 0] }) : h('p', { class: 'note' }, '이 구간에는 켜 둔 규칙에 걸린 점이 없습니다.'),
+      h('div', { class: 'btn-row', style: 'margin-top:10px' }, h('button', { type: 'button', class: 'btn', onclick: function () { exportSpc(s, charts, evs, w, win); } }, '엑셀로 내려받기(이탈 목록·관리 한계·정지·리셋)')));
+
+    return [pageHead('실시간', '실시간 관리도 — ' + ui.spc.press, '전류·전압·온도·진동을 2초 값 그대로 시간순으로 그리고, 기준 구간의 평균(중심선)과 ±3σ 관리선(UCL/LCL)으로 벗어남을 봅니다.',
+      h('a', { class: 'btn', href: '#/import' }, '로그 더 넣기')),
+      controls, h('h2', { class: 'sec' }, '마지막 값'), lastCards, figs, spcRulesCard(O, s, info), stroke, evBox];
+  }
+  function fmt(v, d) {
+    if (v == null || !isFinite(v)) return '-';
+    if (d == null) { var a = Math.abs(v); d = a >= 100 ? 1 : a >= 10 ? 2 : 3; }
+    return Number(v).toLocaleString('ko-KR', { minimumFractionDigits: d, maximumFractionDigits: d });
+  }
+  function hourFig(w, O) {
+    var hs = w.hours.filter(function (x) { return x.covered > 0; }).slice(-24);
+    if (!hs.length) return null;
+    var every = Math.ceil(hs.length / 12);
+    var labels = hs.map(function (x, i) { return i % every ? '' : P.stampText(x.t, hs.length > 1 && P.dateOf(hs[0].t) !== P.dateOf(hs[hs.length - 1].t) ? 'md' : 'time').replace(/:00(:00)?$/, '시').replace(/ (\d\d):\d\d$/, ' $1시'); });
+    return C.figure('시간별 타수' + (w.hours.length > 24 ? ' (마지막 24칸)' : '') + ' — 기준 = 기록된 시간 ÷ ' + O.cycleSec + '초', { labels: labels, type: 'bar', unit: '타',
+      series: [{ name: '친 타수', values: hs.map(function (x) { return x.strokes; }), color: 'var(--series-1)' }, { name: '기준(' + O.cycleSec + '초 1타)', values: hs.map(function (x) { return Math.round(x.expected); }), color: 'var(--series-5)' }] });
+  }
+  function spcRulesCard(O, s, info) {
+    var method = h('select', { 'aria-label': 'σ 계산' }, h('option', { value: 'sd', selected: O.method === 'sd' }, '표본 표준편차 (기본)'), h('option', { value: 'mr', selected: O.method === 'mr' }, '이동범위 MR̄ ÷ 1.128 (I-MR)'));
+    var mode = h('select', { 'aria-label': '기준 구간' }, h('option', { value: 'firstN', selected: O.baseMode === 'firstN' }, '처음 N개'), h('option', { value: 'range', selected: O.baseMode === 'range' }, '기준 기간 지정'));
+    var nIn = h('input', { type: 'number', min: 10, step: 1, value: O.baseN, inputmode: 'numeric', 'aria-label': '처음 몇 개' });
+    var bf = h('input', { type: 'datetime-local', step: 1, value: O.baseFrom || P.toLocalInput(s.t[0]), 'aria-label': '기준 시작' });
+    var bt = h('input', { type: 'datetime-local', step: 1, value: O.baseTo || P.toLocalInput(Math.min(s.t[s.n - 1], s.t[0] + 3600)), 'aria-label': '기준 끝' });
+    function box(checked, t, sub) { var b = h('input', { type: 'checkbox' }); b.checked = !!checked; return { el: b, label: h('label', { class: 'opt' }, b, h('span', null, h('span', { class: 't' }, t), sub ? h('span', { class: 's' }, sub) : null)) }; }
+    var warn = box(O.warnLines, '±2σ 경고선 그리기'), stops = box(O.excludeStops, '정지 구간 값은 빼기', '정지하면 전류·진동이 떨어져 늘 이탈로 나옵니다');
+    var rb = { r1: box(true, '1점이 ±3σ 밖', '늘 봄'), run9: box(O.rules.run9, '연속 9점이 중심선 한쪽', '평균이 옮겨 간 것'), trend6: box(O.rules.trend6, '연속 6점 계속 증가·감소', '추세'), two3: box(O.rules.two3, '3점 중 2점이 ±2σ 밖', '같은 쪽') };
+    rb.r1.el.disabled = true;
+    var cyc = h('input', { type: 'number', min: 1, step: 1, value: O.cycleSec, 'aria-label': '기준 사이클(초)' });
+    var stp = h('input', { type: 'number', min: 2, step: 1, value: O.stopSec, 'aria-label': '정지로 볼 시간(초)' });
+    var gap = h('input', { type: 'number', min: 2, step: 1, value: O.gapSec, 'aria-label': '기록 끊김으로 볼 시간(초)' });
+    var br = P.baseRange(s, info, O, ui.spc.die);
+    return h('section', { class: 'card', id: 'spcRules' }, h('h2', null, '관리도 기준'),
+      h('ul', { class: 'note explain' },
+        h('li', null, h('strong', null, '중심선·관리선'), ' — 기준 구간 값의 평균이 중심선, 평균 ± 3σ 가 관리선(UCL·LCL)입니다. 지금 기준 구간: ' + (isFinite(br.from) ? P.stampText(br.from) + ' ~ ' + P.stampText(br.to) + ' (' + N(br.n) + '개)' : '없음') + (br.short ? ' — 값이 N개보다 적어 있는 만큼 썼습니다' : '') + '. 그래프의 옅은 띠입니다.'),
+        h('li', null, h('strong', null, '기준 구간 = 처음 1,800개(2초 간격 1시간)가 기본'), ' — 설비가 정상이던 때로 골라 주세요(예열이 끝난 뒤, 금형 교체 직후 등). 다른 구간을 기준으로 삼고 싶으면 「기준 기간 지정」.'),
+        h('li', null, h('strong', null, 'σ 는 표본 표준편차가 기본'), ' — 이동범위(MR̄/1.128)는 하나씩 재는 값의 표준 관리도(I-MR) 방식이지만, 2초 값은 앞뒤 값이 거의 같아(자기상관) σ 가 매우 작게 잡힙니다. 받은 로그(3,600행)로 재 보니 이동범위 방식은 온도 3,425점·전류 2,520점이 관리선 밖으로 나왔고, 표본 표준편차는 0점이었습니다. 1분·5분 평균으로 묶어 볼 때는 이동범위도 쓸 만합니다.'),
+        h('li', null, h('strong', null, '규칙'), ' — 1점 ±3σ 는 늘 봅니다. 「연속 9점 한쪽」 「연속 6점 증가·감소」는 2초 값에서는 정상이어도 아주 자주 걸려(받은 로그 전류 3,600점 중 3,086점이 연속 9점 한쪽) 기본은 꺼 두었습니다. 1분 평균으로 묶어 볼 때 켜 보세요.')),
+      h('div', { class: 'form-grid' }, fld('σ 계산', method), fld('기준 구간', mode), fld('처음 몇 개', nIn, '2초 간격이면 1,800개 = 1시간'),
+        fld('기준 기간 — 시작', bf), fld('기준 기간 — 끝', bt), h('div', { class: 'field span-all' }, h('span', null, '그리기'), h('div', { class: 'opt-grid' }, warn.label, stops.label))),
+      h('div', { class: 'field', style: 'margin-top:12px' }, h('span', null, '이상 판정 규칙'), h('div', { class: 'opt-grid' }, rb.r1.label, rb.run9.label, rb.trend6.label, rb.two3.label)),
+      h('div', { class: 'form-grid', style: 'margin-top:12px' }, fld('기준 사이클(초) — 몇 초에 1타', cyc, '받은 설명: 10초에 1타'), fld('정지로 볼 시간(초)', stp, '이만큼 타수가 안 오르면 정지(기본 60초 = 6사이클)'), fld('기록 끊김으로 볼 시간(초)', gap, '2초 로그 기준 30초')),
+      h('div', { class: 'btn-row', style: 'margin-top:12px' },
+        h('button', { type: 'button', class: 'btn btn-primary', onclick: function () {
+          var before = P.cleanOpts(db.spc);
+          db.spc = P.cleanOpts({ method: method.value, baseMode: mode.value, baseN: nIn.value, baseFrom: bf.value, baseTo: bt.value, warnLines: warn.el.checked, excludeStops: stops.el.checked,
+            rules: { r1: true, run9: rb.run9.el.checked, trend6: rb.trend6.el.checked, two3: rb.two3.el.checked }, cycleSec: cyc.value, stopSec: stp.value, gapSec: gap.value });
+          if (before.stopSec !== db.spc.stopSec || before.gapSec !== db.spc.gapSec || before.cycleSec !== db.spc.cycleSec || before.excludeStops !== db.spc.excludeStops) { rawInfo = {}; rebuildDaily(Object.keys(raw)); }
+          save(); toast('관리도 기준을 바꿨습니다.'); render();
+        } }, '기준 적용'),
+        h('button', { type: 'button', class: 'btn', onclick: function () { db.spc = {}; rawInfo = {}; rebuildDaily(Object.keys(raw)); save(); toast('기본값으로 되돌렸습니다.'); render(); } }, '기본값으로')));
+  }
+  function exportSpc(s, charts, evs, w, win) {
+    var wb = XLSX.utils.book_new(), O = P.cleanOpts(db.spc);
+    var a = [['프레스', '채널', '시작', '끝', '점 수', '규칙', '가장 먼 값', '단위', '중심선에서(σ)', '방향', '중심선', 'UCL', 'LCL']];
+    evs.slice().reverse().forEach(function (x) { var m = CH_META[x.ch]; a.push([s.press, m.label, P.stampText(x.e.from), P.stampText(x.e.to), x.e.n, x.e.rules.join(', '), L.round(x.e.peak, 4), m.unit, L.round(x.e.z, 2), x.e.side === 'up' ? '높음' : '낮음', L.round(x.lim.center, 4), L.round(x.lim.ucl, 4), L.round(x.lim.lcl, 4)]); });
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(a), '이탈 목록');
+    var b = [['프레스', '채널', '단위', '묶어 보기', 'σ 계산', '기준 구간 시작', '기준 구간 끝', '기준 값 수', '중심선', 'σ', 'UCL(+3σ)', 'LCL(−3σ)', '+2σ', '−2σ', '보는 구간 시작', '보는 구간 끝', '±3σ 밖 점', '연속 9점', '연속 6점', '3점 중 2점']];
+    charts.forEach(function (d) { var m = CH_META[d.channel], l = d.lim || {}; b.push([s.press, m.label, m.unit, ui.spc.group ? ui.spc.group / 60 + '분 평균' : '2초 원값', O.method === 'mr' ? 'MR̄/1.128' : '표본 표준편차',
+      P.stampText(d.base.from), P.stampText(d.base.to), d.lim ? d.lim.n : 0, L.round(l.center, 4), L.round(l.sigma, 5), L.round(l.ucl, 4), L.round(l.lcl, 4), L.round(l.uwl, 4), L.round(l.lwl, 4), P.stampText(win.from), P.stampText(win.to), d.count.r1, d.count.run9, d.count.trend6, d.count.two3]); });
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(b), '관리 한계');
+    var c = [['시작', '끝', '길이(초)']]; w.stops.forEach(function (x) { c.push([P.stampText(x.from), P.stampText(x.to), Math.round(x.sec)]); });
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(c), '정지 구간');
+    var r = [['시각', '바뀌기 전 금형', '바뀐 뒤 금형', '바뀌기 전 금형 타수', '알아낸 방법']]; w.resets.forEach(function (x) { r.push([P.stampText(x.t), x.fromDie, x.toDie, isFinite(x.before) ? x.before : null, x.kind]); });
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(r), '금형 리셋');
+    var hr = [['시각(시간 칸)', '친 타수', '기준 타수', '기준 대비', '기록된 시간(분)', '가동 시간(분)']]; w.hours.forEach(function (x) { hr.push([P.stampText(x.t), x.strokes, Math.round(x.expected), x.perf == null ? null : L.round(x.perf * 100, 1), L.round(x.covered / 60, 1), L.round(x.run / 60, 1)]); });
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(hr), '시간별 타수');
+    XLSX.writeFile(wb, '관리도_' + s.press + '_' + P.stampText(win.from).slice(0, 10) + '.xlsx');
+  }
+  /* 대시보드 — 2초 로그 마지막 값(프레스마다, 최근 1시간 기준) */
+  function rawDash() {
+    var presses = Object.keys(raw).sort(L.natCmp);
+    if (!presses.length) return null;
+    var O = P.cleanOpts(db.spc);
+    return [h('h2', { class: 'sec' }, '2초 센서 — 마지막 값', h('a', { class: 'dp-more', href: '#/spc' }, '실시간 관리도')),
+      h('div', { class: 'press-grid' }, presses.map(function (p) {
+        var s = raw[p], info = infoOf(p), last = s.t[s.n - 1], view = { from: last - 3600, to: last };
+        var ds = chansOf(s).map(function (c) { return P.chartData(s, info, c, O, view); });
+        var r = P.rangeIdx(s, view.from, view.to), w = P.strokeWindow(s, info, r[0], r[1]);
+        var outs = ds.reduce(function (a, d) { return a + d.events.length; }, 0);
+        var lastOut = ds.some(function (d) { return d.lim && d.last && (d.last.v > d.lim.ucl || d.last.v < d.lim.lcl); });
+        var lv = lastOut ? 'bad' : outs ? 'warn' : 'ok';
+        var stopNow = info.counted && isFinite(w.sinceStroke) && w.sinceStroke > O.stopSec;
+        return h('article', { class: 'pcard lv-' + lv },
+          h('div', { class: 'pcard-top' }, h('div', null, h('h3', null, p), h('div', { class: 'note' }, (s.type || '종류 미입력') + ' · ' + P.stampText(last))),
+            h('span', { class: 'pill lv-' + lv }, lastOut ? '관리선 밖' : outs ? '최근 1시간 이탈 ' + outs + '번' : '관리선 안')),
+          h('ul', { class: 'sens' }, ds.map(function (d) {
+            var m = CH_META[d.channel], bad = d.lim && d.last && (d.last.v > d.lim.ucl || d.last.v < d.lim.lcl);
+            return h('li', null, h('span', { class: 'k' }, m.label), h('span', { class: 'v' }, d.last ? fmt(d.last.v) + m.unit : '-'),
+              h('span', { class: 'note' }, d.lim ? fmt(d.lim.lcl) + ' ~ ' + fmt(d.lim.ucl) : '기준 없음'), bad ? pill('bad') : null);
+          })),
+          info.counted ? h('dl', { class: 'pstats' },
+            h('dt', null, '최근 1시간 타수'), h('dd', null, N(w.strokes) + '타 · 기준 대비 ' + L.pctText(w.perf)),
+            h('dt', null, '지금'), h('dd', null, stopNow ? '정지 ' + P.durText(w.sinceStroke) + ' 째' : '가동 중'),
+            h('dt', null, '정지'), h('dd', null, w.stops.length ? w.stops.length + '번 · ' + P.durText(w.stops.reduce(function (a, x) { return a + x.sec; }, 0)) : '없음')) : null,
+          h('div', { class: 'btn-row' }, h('button', { type: 'button', class: 'btn btn-sm', onclick: function () { ui.spc.press = p; ui.spc.die = -1; ui.spc.view = 60; location.hash = '#/spc'; } }, '관리도 보기')));
+      }))];
   }
 
   /* ── ① 금형 타수·교체 ───────────────────── */
@@ -489,18 +850,13 @@
       }));
     }), { cls: 'matrix' });
     var mine = A.anomalies.filter(function (a) { return a.press === ui.press; });
-    var timed = A.rows.some(function (r) { return r.press === ui.press && r.time; });
     var figs = mine.map(function (a) {
-      var points = timed ? A.rows.filter(function (r) {
-        return r.press === ui.press && r[a.channel] != null;
-      }).map(function (r) { return { date: r.date, time: r.time || '00:00:00', v: r[a.channel] }; }) : a.points;
       return h('section', { class: 'card an lv-' + a.level },
         h('div', { class: 'an-top' }, pill(a.level), h('strong', null, ui.press + ' · ' + a.label + (a.unit ? '(' + a.unit + ')' : ''))),
         h('p', { class: 'an-ev' }, a.evidence),
         a.base ? h('p', { class: 'note' }, '기준선 구간 ' + a.base.from + ' ~ ' + a.base.to + ' (가동일 ' + a.base.n + '일) · 최근 구간 ' + a.recent.from + ' ~ ' + a.recent.to + ' (가동일 ' + a.recent.n + '일) · σ ' + N(a.base.sigma, 3) + a.unit +
           (a.base.floored ? ' (값이 거의 같아 기준선의 0.5% 를 바닥값으로 씀)' : '')) : null,
-        timed ? h('p', { class: 'note' }, '차트는 수집 시각별 원시값을 표시합니다. 위 이상 판정은 일평균 기준이며 차트의 개별 측정값에는 적용하지 않습니다.') : null,
-        C.sensorFigure(a.label + (timed ? ' 수집 시각별 측정값 — ' : ' 하루 평균 — ') + ui.press, { points: points, timed: timed, base: timed ? null : a.base, recentFrom: timed ? null : a.recent.from, unit: a.unit, k: R.k, kWarn: R.kWarn, color: CH_COLOR[a.channel] }));
+        C.sensorFigure(a.label + ' 하루 평균 — ' + ui.press, { points: a.points, base: a.base, recentFrom: a.recent.from, unit: a.unit, k: R.k, kWarn: R.kWarn, color: CH_COLOR[a.channel] }));
     });
     return [
       pageHead('③', '이상 감지 (통계 기준)', '평소(기준선)보다 벗어난 날이 이어지는지를 봅니다. 고장 기록으로 배운 예측이 아니라 「평소와 다름」을 알리는 1단계입니다.'),
@@ -695,7 +1051,7 @@
       rulesCard(),
       AIP.settingsCard({ toast: toast, onChange: render }),
       h('section', { class: 'card' }, h('h2', null, '백업'),
-        h('p', { class: 'note' }, '쌓인 로그와 기준표는 이 브라우저에만 있습니다. 다른 PC 로 옮기거나 브라우저 정리 전에 JSON 으로 받아 두세요.'),
+        h('p', { class: 'note' }, '쌓인 로그와 기준표는 이 브라우저에만 있습니다. 다른 PC 로 옮기거나 브라우저 정리 전에 JSON 으로 받아 두세요. 2초 센서 로그 원본은 너무 커서 JSON 에 넣지 않습니다(하루 묶음과 관리도 기준은 들어감) — 원본 CSV 를 따로 보관해 주세요.'),
         h('div', { class: 'btn-row' },
           h('button', { type: 'button', class: 'btn', onclick: function () { download('프레스예지보전_백업_' + new Date().toISOString().slice(0, 10) + '.json', new Blob([JSON.stringify(db)], { type: 'application/json' })); } }, 'JSON 백업 내려받기'),
           h('label', { class: 'btn' }, backup, 'JSON 백업 불러오기')))
@@ -747,6 +1103,7 @@
   /* ── 라우터 ─────────────────────────────── */
   var PAGES = [
     { id: 'dash', no: '홈', t: '대시보드', s: '프레스 상태·금형 수명', fn: pageDash },
+    { id: 'spc', no: '실', t: '실시간 관리도', s: '2초 센서 ±3σ·타수·정지', fn: pageSpc },
     { id: 'import', no: '0', t: '데이터 가져오기', s: '로그 엑셀·CSV 여러 개', fn: pageImport },
     { id: 'die', no: '①', t: '금형 타수·교체', s: '수명 사용률·교체 예정일', fn: pageDie },
     { id: 'overhaul', no: '②', t: '오버홀 알림', s: '타수·일수 주기', fn: pageOverhaul },
@@ -755,7 +1112,7 @@
     { id: 'ai', no: '⑤', t: 'AI 분석', s: '사실만 담은 프롬프트', fn: pageAi },
     { id: 'settings', no: '설', t: '설정', s: '기준표·판정 기준·백업', fn: pageSettings }
   ];
-  function route() { var id = (location.hash || '').replace(/^#\//, '').split('?')[0]; return PAGES.filter(function (p) { return p.id === id; })[0] || (db.records.length ? PAGES[0] : PAGES[1]); }
+  function route() { var id = (location.hash || '').replace(/^#\//, '').split('?')[0]; return PAGES.filter(function (p) { return p.id === id; })[0] || (db.records.length ? PAGES[0] : PAGES.filter(function (p) { return p.id === 'import'; })[0]); }
   function render() {
     var p = route();
     A = L.analyze(db);
@@ -769,9 +1126,11 @@
     document.getElementById('dataChip').textContent = db.records.length
       ? '기준일 ' + A.asOf + ' · 프레스 ' + A.statuses.length + '대 · 금형 ' + A.dies.length + '개 · 로그 ' + L.fmtN(db.records.length) + '행'
       : '데이터 없음';
+    if (rawRows()) document.getElementById('dataChip').textContent += ' · 2초 로그 ' + L.fmtN(rawRows()) + '행';
     var b = document.getElementById('sampleBanner');
     b.hidden = !db.sample;
-    b.textContent = '지금 보시는 것은 가상 샘플입니다(프레스 P1~P4 × 90일, 금형 M-01~M-08). 금형 M-05 수명 임박, P2 전류·온도 상승(마지막 2주), P4 오버홀 주기 지남을 일부러 심어 두었습니다. 실제 로그를 넣기 전에 「데이터 가져오기 → 모든 데이터 지우기」를 해 주세요.';
+    if (db.sampleKind === 'raw') b.textContent = '지금 보시는 것은 2초 로그 가상 샘플입니다(프레스 P1~P4 × 10/19~10/21, 08~12시·13~17시). P2 10/21 오후 전류·온도 상승, P3 10/20 10:00 20분 정지와 10/21 14시대 진동 튐, P4 10/20 13:00 금형 M-07→M-08 교체, P4 10/21 오후 전압 조금 내려앉음(연속 9점 규칙으로 보임), P1 10/20 15:10 기록 끊김을 심어 두었습니다. 3일치라 일 단위 이상 감지는 「비교 못 함」으로 나옵니다.';
+    else b.textContent = '지금 보시는 것은 가상 샘플입니다(프레스 P1~P4 × 90일, 금형 M-01~M-08). 금형 M-05 수명 임박, P2 전류·온도 상승(마지막 2주), P4 오버홀 주기 지남을 일부러 심어 두었습니다. 실제 로그를 넣기 전에 「데이터 가져오기 → 모든 데이터 지우기」를 해 주세요.';
     main.innerHTML = '';
     add(main, p.fn());
     document.title = p.t + ' — 프레스·금형 예지보전';
@@ -779,4 +1138,11 @@
   }
   window.addEventListener('hashchange', function () { render(); main.focus(); window.scrollTo(0, 0); });
   render();
+  RS.loadAll().then(function (m) {
+    rawSaved = RS.available() !== false;
+    var ks = Object.keys(m).filter(function (k) { return m[k] && m[k].n && m[k].t; });
+    if (!ks.length) return;
+    ks.forEach(function (k) { raw[k] = m[k]; });
+    render();
+  });
 })();

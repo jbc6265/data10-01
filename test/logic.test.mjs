@@ -1,13 +1,13 @@
 // 실행: node test/logic.test.mjs   (의존성 없음 — vendor 의 SheetJS 만 씀)
 // 실제 프레스 로그는 아직 받지 않았습니다. 여기서는 손으로 만든 작은 표와 가상 샘플 90일로 검사합니다.
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const L = require('../js/logic.js');
 const Sample = require('../js/sample-data.js');
 const XLSX = require('../vendor/xlsx.full.min.js');
 const AI = require('../js/ai-endpoint.js');
+const P = require('../js/spc.js');
 
 let passed = 0;
 function test(name, fn) {
@@ -26,12 +26,12 @@ function series(press, from, n, fn) {
 const wiggle = i => [0.3, -0.5, 0.8, -0.2, 0.1, -0.9, 0.6, -0.4, 0.2, -0.7, 0.5, 0][i % 12];
 
 console.log('열 찾기 · 값 읽기');
-test('제목 줄 아래 머리행을 찾고, 단위 괄호를 떼고 이름으로 연결 (금형 타수 → 타수)', () => {
+test('제목 줄 아래 머리행을 찾고, 단위 괄호를 떼고 이름으로 연결 (금형 타수 → 금형 누적 타수, 2차)', () => {
   const aoa = [['■ 프레스 로그'], ['일자', '프레스', '프레스 종류', '금형명', '프레스 누적 타수', '금형 타수', '가동 시간(h)', '전류(A)', '전압(V)', '온도(℃)', '진동(mm/s)'], ['2026-10-01', 'P1', '유압', 'M-01', 1000, 50, 8, 80, 380, 44, 2.1]];
   const d = L.detectColumns(aoa);
   assert.equal(d.headerRow, 1);
   assert.deepEqual(d.missing, []);
-  assert.equal(d.map.strokes, 5); assert.equal(d.map.pressCum, 4); assert.equal(d.map.current, 7); assert.equal(d.map.temp, 9); assert.equal(d.map.vib, 10);
+  assert.equal(d.map.strokes, undefined); assert.equal(d.map.dieCum, 5); assert.equal(d.map.pressCum, 4); assert.equal(d.map.current, 7); assert.equal(d.map.temp, 9); assert.equal(d.map.vib, 10);
   assert.equal(d.warnings.length, 0);
 });
 test('열 순서·표기가 달라도 찾음 (설비명·톤수·유온·운전시간(분)) — 분은 시간으로 바꿈', () => {
@@ -84,37 +84,6 @@ test('여러 시트 중 로그 시트를 고름', () => {
 });
 
 console.log('누적 · 타수 계산');
-test('2초 간격 CSV — 3,600행 보존, 금형 누적 자동 연결, 실제 타수 719타', () => {
-  const bytes = readFileSync(new URL('../samples/프레스로그_2초간격_2시간.csv', import.meta.url));
-  const wb = XLSX.read(L.decodeCsv(bytes).text, { type: 'string', raw: true });
-  const aoa = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1 });
-  const p = L.parseSheet(aoa);
-  assert.equal(p.records.length, 3600);
-  assert.equal(p.det.map.strokes, undefined);
-  assert.equal(p.det.map.dieCum, 5);
-  assert.equal(p.records[0].runHr, null);
-  assert.equal(p.records[1].time, '09:00:02');
-  const merged = L.mergeRecords([], p.records);
-  assert.equal(merged.records.length, 3600);
-  assert.equal(L.mergeRecords(merged.records, p.records).records.length, 3600);
-  const d = L.deriveStrokes(merged.records);
-  assert.equal(d.rows.reduce((sum, r) => sum + (r.s || 0), 0), 719);
-  assert.equal(d.stat.noPrev, 1);
-  assert.equal(d.stat.mismatch, 0);
-  assert.equal(d.rows[4].s, 0); assert.equal(d.rows[5].s, 1);
-  assert.equal(d.rows.at(-1).dieCum, 719);
-  const manual = L.parseSheet(aoa, { overrides: { strokes: 5, dieCum: -1 } });
-  assert.equal(manual.records[5].strokes, 1);
-  assert.equal(manual.records[5].dieCum, null);
-});
-test('초 단위 — 문자열·엑셀 일련번호·Date·별도 시각 및 분 단위와 중복 키 호환', () => {
-  assert.equal(L.toDateTime('2026-10-01 09:00:02').time, '09:00:02');
-  assert.equal(L.toDateTime(46296 + 32402 / 86400).time, '09:00:02');
-  assert.equal(L.toDateTime(new Date(2026, 9, 1, 9, 0, 2)).time, '09:00:02');
-  assert.equal(L.toTime('09:00:02'), '09:00:02');
-  assert.equal(L.toTime(32402 / 86400), '09:00:02');
-  assert.equal(L.recKey({ date: '2026-10-01', time: '09:00', press: 'P1' }), L.recKey({ date: '2026-10-01', time: '09:00:00', press: 'P1' }));
-});
 test('같은 행(일자+시각+프레스+금형)은 다시 가져오면 새 값으로 — 두 번 세지 않음', () => {
   const a = [{ date: '2026-10-01', time: '', press: 'P1', die: 'M', strokes: 10 }];
   const m = L.mergeRecords(a, [{ date: '2026-10-01', time: '', press: 'P1', die: 'M', strokes: 12 }, { date: '2026-10-02', time: '', press: 'P1', die: 'M', strokes: 5 }]);
@@ -365,6 +334,172 @@ test('주소 정리·요청 만들기·키 없으면 머리글 없음', () => {
   assert.equal(r.url, 'https://x.com/v1/chat/completions'); assert.ok(!r.init.headers.Authorization);
   assert.ok(AI.validateConfig({ baseUrl: 'http://10.0.0.1/v1', model: 'm' }, 'https:').errors.length > 0);
   assert.equal(AI.toStored({ baseUrl: 'https://x.com/v1', model: 'm', apiKey: 'k', remember: false }).apiKey, '');
+});
+
+console.log('2초 센서 로그 · 관리도 (2차)');
+const RAW_HEAD = ['일자', '프레스', '프레스 종류', '금형명', '프레스 누적 타수', '금형 타수', '전류(A)', '전압(V)', '온도(℃)', '진동(mm/s)', '데이터 구분'];
+function q(cells) { return cells.map(c => '"' + String(c).replace(/"/g, '""') + '"').join(','); }
+/* 수강생 로그와 같은 모양의 작은 CSV — 2초 간격, 10초에 1타 */
+function rawCsv(n, opt = {}) {
+  const L2 = ['﻿' + q(RAW_HEAD)];
+  let pc = 1000, dc = opt.dc0 || 0;
+  for (let i = 0; i < n; i++) {
+    const sec = 9 * 3600 + i * 2;
+    if (i && i % 5 === 0 && !(opt.stop && i >= opt.stop[0] && i < opt.stop[1])) { pc++; dc++; }
+    if (opt.reset === i) dc = 0;
+    const hh = String(Math.floor(sec / 3600)).padStart(2, '0'), mm = String(Math.floor(sec / 60) % 60).padStart(2, '0'), ss = String(sec % 60).padStart(2, '0');
+    L2.push(q(['2026-10-01 ' + hh + ':' + mm + ':' + ss, 'P1', '유압 프레스 800톤', opt.reset != null && i >= opt.reset ? 'M-02' : 'M-01', pc, dc, (85 + wiggle(i)).toFixed(2), '381.00', '43.50', '2.000', '모의 데이터']));
+  }
+  return L2.join('\r\n') + '\r\n';
+}
+function loadRaw(text, chunk = 37) {
+  const rows = []; const p = P.createCsvParser(r => rows.push(r));
+  for (let i = 0; i < text.length; i += chunk) p.push(text.slice(i, i + chunk)); // 일부러 잘게 — 조각 경계에 걸린 따옴표·행
+  p.end();
+  const det = L.detectColumns(rows.slice(0, 60));
+  const b = P.createRawBuilder(det);
+  rows.forEach((r, i) => { if (i > det.headerRow) b.add(r, i + 1); });
+  return { rows, det, hf: P.isHighFreq(rows, det), res: b.finish() };
+}
+test('CSV 나눠 읽기 — BOM·따옴표·「""」·따옴표 안 쉼표·줄바꿈, 조각 경계가 어디든 같은 결과', () => {
+  const text = '﻿"a","b,c","d""e"\r\n1,"x\ny",\r\n"3",,4\n';
+  const want = [['a', 'b,c', 'd"e'], ['1', 'x\ny', null], ['3', null, '4']];
+  for (const size of [1, 2, 3, 5, 7, 100]) {
+    const out = []; const p = P.createCsvParser(r => out.push(r));
+    for (let i = 0; i < text.length; i += size) p.push(text.slice(i, i + size));
+    p.end();
+    assert.deepEqual(out, want, '조각 ' + size);
+  }
+});
+test('수강생 형식(2초 간격·모든 칸 따옴표) — 열 연결, 2초 로그로 판별, 시각은 초까지', () => {
+  const r = loadRaw(rawCsv(200));
+  assert.deepEqual(r.det.missing, []);
+  assert.equal(r.det.map.pressCum, 4); assert.equal(r.det.map.dieCum, 5); assert.equal(r.det.map.vib, 9);
+  assert.equal(r.hf.high, true); assert.equal(r.hf.interval, 2);
+  const s = r.res.series.P1;
+  assert.equal(s.n, 200); assert.equal(s.type, '유압 프레스 800톤');
+  assert.equal(P.stampText(s.t[1]), '2026-10-01 09:00:02');
+  near(s.current[0], 85.3, 1e-4);
+  assert.equal(P.parseStamp('2026-10-01 09:00:02') - P.parseStamp('2026-10-01 09:00:00'), 2);
+  assert.equal(P.parseStamp(46296.5), P.parseStamp('2026-10-01 12:00:00')); // 엑셀 일련번호
+  assert.ok(isNaN(P.parseStamp('2026-02-30 10:00:00')));
+});
+test('하루 한 행 로그는 2초 로그가 아님(기존 길로)', () => {
+  const aoa = [['일자', '프레스', '타수'], ['2026-10-01', 'P1', 10], ['2026-10-02', 'P1', 12], ['2026-10-03', 'P1', 9]];
+  assert.equal(P.isHighFreq(aoa, L.detectColumns(aoa)).high, false);
+});
+test('합치기 — 같은 시각은 새 값으로(중복 없음), 순서 섞여 들어와도 시각순', () => {
+  const a = loadRaw(rawCsv(100)).res.series.P1;
+  const text2 = rawCsv(150).replace('"85.30"', '"99.99"');
+  const b = loadRaw(text2).res.series.P1;
+  const m = P.mergeSeries(a, b);
+  assert.equal(m.n, 150); assert.equal(m.replaced, 100); near(m.current[0], 99.99, 1e-3);
+  for (let i = 1; i < m.n; i++) assert.ok(m.t[i] > m.t[i - 1]);
+  const det = L.detectColumns([RAW_HEAD]);
+  const bb = P.createRawBuilder(det);
+  bb.add(['2026-10-01 09:00:04', 'P1', '', 'M', '1', '1', '1', '1', '1', '1', '']); bb.add(['2026-10-01 09:00:00', 'P1', '', 'M', '1', '1', '2', '1', '1', '1', '']);
+  const sx = bb.finish().series.P1; assert.equal(sx.current[0], 2);
+});
+test('타수 — 누적 차이로 세고, 10초 1타 기준 가동률 100%, 정지 구간과 금형 리셋(교체) 감지', () => {
+  const s = loadRaw(rawCsv(1800, { stop: [600, 900], reset: 1200 })).res.series.P1; // 1시간 · 20~30분 사이 정지 · 40분에 금형 교체
+  const info = P.strokeInfo(s);
+  assert.equal(info.source, '프레스 누적 타수');
+  const w = P.strokeWindow(s, info, 0, s.n);
+  assert.equal(w.stops.length, 1); assert.ok(w.stops[0].sec >= 550 && w.stops[0].sec <= 610, '정지 ' + w.stops[0].sec);
+  assert.equal(info.resets.length, 1); assert.equal(info.resets[0].fromDie, 'M-01'); assert.equal(info.resets[0].toDie, 'M-02'); assert.equal(info.resets[0].after, 0);
+  assert.equal(w.strokes, 359 - 60); near(w.availability, (3598 - 600) / 3598, 0.01);
+  const full = P.strokeWindow(loadRaw(rawCsv(900)).res.series.P1, P.strokeInfo(loadRaw(rawCsv(900)).res.series.P1), 0, 900);
+  near(full.perf, 1, 0.01); assert.equal(full.stops.length, 0);
+});
+test('금형 타수만 있을 때 — 0 으로 돌아간 뒤 센 만큼 더함', () => {
+  const det = L.detectColumns([['일자', '프레스', '금형명', '금형 타수', '전류']]);
+  const b = P.createRawBuilder(det);
+  [['09:00:00', 'A', 5], ['09:00:10', 'A', 6], ['09:00:20', 'B', 0], ['09:00:30', 'B', 1], ['09:00:40', 'B', 2]].forEach(r => b.add(['2026-10-01 ' + r[0], 'P1', r[1], r[2], 80]));
+  const s = b.finish().series.P1, info = P.strokeInfo(s);
+  assert.equal(info.source, '금형 타수'); assert.equal(info.resets.length, 1);
+  assert.equal(P.strokeWindow(s, info, 0, s.n).strokes, 3);
+});
+test('금형 리셋 — 금형명만 바뀌어도(타수 계속 오름), 금형 타수만 0 으로 돌아가도 감지', () => {
+  const det = L.detectColumns([['일자', '프레스', '금형명', '프레스 누적 타수', '금형 타수']]);
+  const b = P.createRawBuilder(det);
+  [['09:00:00', 'A', 100, 50], ['09:00:10', 'A', 101, 51], ['09:00:20', 'B', 102, 52], ['09:00:30', 'B', 103, 0], ['09:00:40', 'B', 104, 1]].forEach(r => b.add(['2026-10-01 ' + r[0], 'P1', r[1], r[2], r[3]]));
+  const info = P.strokeInfo(b.finish().series.P1);
+  assert.deepEqual(info.resets.map(r => r.kind + ':' + r.fromDie + '>' + r.toDie), ['금형 바뀜:A>B', '금형 타수 0 으로:B>B']);
+});
+test('관리 한계 — 표본 표준편차와 이동범위(MR̄/1.128)', () => {
+  const v = [10, 12, 11, 13, 9, 10, 12, 11];
+  const sd = P.limits(v, 'sd'), mr = P.limits(v, 'mr');
+  near(sd.center, 11); near(sd.sigma, Math.sqrt(12 / 7)); near(sd.ucl, 11 + 3 * Math.sqrt(12 / 7)); near(sd.lwl, 11 - 2 * Math.sqrt(12 / 7));
+  near(mr.mrBar, (2 + 1 + 2 + 4 + 1 + 2 + 1) / 7); near(mr.sigma, mr.mrBar / 1.128); near(mr.lcl, 11 - 3 * mr.mrBar / 1.128);
+  assert.equal(P.limits([5], 'sd'), null);
+  assert.ok(P.limits([7, 7, 7], 'sd').sigma > 0); // 모두 같은 값이어도 0 으로 나누지 않음
+});
+test('이상 규칙 — 1점 ±3σ, 연속 9점 한쪽, 연속 6점 증가, 3점 중 2점 ±2σ (꺼 두면 안 걸림)', () => {
+  const lim = { center: 0, sigma: 1, ucl: 3, lcl: -3, uwl: 2, lwl: -2 };
+  const all = { r1: true, run9: true, trend6: true, two3: true };
+  let r = P.evalRules([0, 3.5, 0, -0.2, -3.1], lim, all);
+  assert.deepEqual(Array.from(r.flags).map(f => f & 1), [0, 1, 0, 0, 1]);
+  r = P.evalRules([0.1, 0.2, 0.1, 0.3, 0.1, 0.2, 0.1, 0.4, 0.1, 0.2], lim, all);
+  assert.equal(r.count.run9, 2); assert.equal(r.flags[8] & 2, 2); assert.equal(r.flags[7] & 2, 0);
+  r = P.evalRules([-1, -0.5, 0.1, 0.4, 0.9, 1.2, 1.1], lim, all);
+  assert.equal(r.flags[5] & 4, 4); assert.equal(r.flags[4] & 4, 0); assert.equal(r.flags[6] & 4, 0);
+  r = P.evalRules([2.5, 0, 2.2, 0], lim, all);
+  assert.equal(r.flags[2] & 8, 8); assert.equal(r.flags[3] & 8, 0);
+  r = P.evalRules([0.1, 0.2, 0.1, 0.3, 0.1, 0.2, 0.1, 0.4, 0.1, 0.2], lim, { r1: true });
+  assert.equal(r.count.run9, 0);
+  r = P.evalRules([0.1, 0.2, 0.1, NaN, 0.3, 0.1, 0.2, 0.1, 0.4, 0.1], lim, all); // 빈 값은 연속을 끊음
+  assert.equal(r.count.run9, 0);
+});
+test('사건 묶기 — 이어진 이탈점은 하나로, 가장 먼 값과 z', () => {
+  const t = Float64Array.from([0, 2, 4, 6, 100, 102]);
+  const ev = P.toEvents(t, [0, 4, 5, 0, -4, 0], Uint8Array.from([0, 1, 1, 0, 1, 0]), { center: 0, sigma: 1 }, 10, 0);
+  assert.equal(ev.length, 2); assert.equal(ev[0].n, 2); assert.equal(ev[0].peak, 5); assert.equal(ev[1].side, 'down'); near(ev[1].z, -4);
+});
+test('그래프 줄이기 — 칸마다 최소·최대·평균, 이탈점은 빠지지 않음', () => {
+  const n = 20000, t = new Float64Array(n), v = new Float32Array(n), f = new Uint8Array(n);
+  for (let i = 0; i < n; i++) { t[i] = i * 2; v[i] = 10 + wiggle(i); }
+  v[12345] = 30; f[12345] = 1; v[777] = -5; f[777] = 1;
+  const d = P.downsample(t, v, f, 0, 300);
+  assert.equal(d.raw, false); assert.ok(d.buckets.length <= 300);
+  assert.equal(Math.max(...d.buckets.map(b => b.max)), 30); assert.equal(Math.min(...d.buckets.map(b => b.min)), -5);
+  assert.deepEqual(d.viol.map(x => x.v).sort((a, b) => a - b), [-5, 30]);
+});
+test('관리도 한 장 — 처음 N개 기준, 정지 구간은 뺌, 뒤쪽 이탈만 잡힘', () => {
+  const s = loadRaw(rawCsv(1800, { stop: [600, 900] })).res.series.P1;
+  s.current[1500] = 120; s.current[700] = 10; // 700 은 정지 구간 안
+  const info = P.strokeInfo(s);
+  const d = P.chartData(s, info, 'current', { baseN: 300 }, {});
+  assert.equal(d.base.n, 300); assert.equal(d.count.r1, 1); assert.equal(d.events[0].from, s.t[1500]);
+  const d2 = P.chartData(s, info, 'current', { baseN: 300, excludeStops: false }, {});
+  assert.equal(d2.count.r1, 2);
+  const g = P.chartData(s, info, 'current', { baseN: 300 }, { groupSec: 60 });
+  assert.ok(g.cs.n >= 49 && g.cs.n <= 51, 'n ' + g.cs.n); // 1분 평균 60칸 − 정지 10분(빈 칸은 뺌)
+});
+test('원 로그 → 일 집계(기존 일 단위 판정으로) — 타수·가동 시간·센서 평균, 정지 값은 평균에서 뺌', () => {
+  const s = loadRaw(rawCsv(1800, { stop: [600, 900] })).res.series.P1;
+  const days = P.dailyFromSeries(s);
+  assert.equal(days.length, 1);
+  const d = days[0];
+  assert.equal(d.date, '2026-10-01'); assert.equal(d.time, ''); assert.equal(d.src, 'raw'); assert.equal(d.strokes, 299);
+  assert.ok(d.runHr > 0.8 && d.runHr < 0.85, 'runHr ' + d.runHr);
+  const recs = L.mergeRecords([], days).records;
+  assert.equal(L.deriveStrokes(recs).rows[0].s, 299);
+});
+test('2초 로그 샘플 — 4대 × 3일, 심어 둔 것(P2 전류 상승·P3 정지·P4 금형 교체·P1 기록 끊김)', () => {
+  const det = L.detectColumns([Sample.RAW_HEAD]);
+  const b = P.createRawBuilder(det);
+  const n = Sample.buildRaw(r => b.add(r));
+  const res = b.finish();
+  assert.equal(n, 172350); assert.equal(res.rows, n); assert.deepEqual(Object.keys(res.series), ['P1', 'P2', 'P3', 'P4']);
+  const W = {}; for (const k in res.series) { const s = res.series[k]; W[k] = { s, info: P.strokeInfo(s) }; W[k].w = P.strokeWindow(s, W[k].info, 0, s.n); }
+  assert.equal(W.P3.w.stops.length, 1); assert.equal(P.stampText(W.P3.w.stops[0].from).slice(0, 15), '2026-10-20 09:5');
+  assert.deepEqual(W.P4.info.resets.map(r => r.fromDie + '>' + r.toDie), ['M-07>M-08']);
+  assert.ok(W.P1.w.gaps.some(g => g.sec > 800 && g.sec < 1000));
+  const cur = k => P.chartData(W[k].s, W[k].info, 'current', {}, { groupSec: 60 }).count.r1;
+  assert.ok(cur('P2') > 100, 'P2 ' + cur('P2'));
+  assert.ok(cur('P1') < 40 && cur('P3') < 40, 'P1 ' + cur('P1') + ' P3 ' + cur('P3'));
+  const p2 = P.chartData(W.P2.s, W.P2.info, 'current', {}, {});
+  assert.ok(p2.events.some(e => P.stampText(e.from).startsWith('2026-10-21 1') && e.side === 'up'));
 });
 
 console.log('\n' + passed + '개 통과' + (process.exitCode ? ' — 실패가 있습니다' : ''));
