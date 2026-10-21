@@ -88,11 +88,14 @@
     return x.getUTCMonth() === m - 1 ? isoFromUTC(t) : '';
   }
   function hm(h, m) { return (h >= 0 && h < 24 && m >= 0 && m < 60) ? pad(h) + ':' + pad(m) : ''; }
+  function hms(h, m, s) {
+    var t = hm(h, m);
+    return t && (s == null || (s >= 0 && s < 60)) ? t + (s == null ? '' : ':' + pad(s)) : '';
+  }
   /* 일(fraction) → 'HH:MM' */
   function timeFromFraction(f) {
-    var mins = Math.round(f * 1440);
-    if (mins >= 1440) mins = 1439;
-    return mins > 0 ? hm(Math.floor(mins / 60), mins % 60) : '';
+    var secs = Math.min(86399, Math.round(f * 86400));
+    return secs > 0 ? hms(Math.floor(secs / 3600), Math.floor(secs / 60) % 60, secs % 60 || null) : '';
   }
   /* 엑셀 날짜(일련번호 · Date · 글자) → { date:'YYYY-MM-DD', time:'HH:MM'|'' }. 못 읽으면 date ''.
      앱은 엑셀을 cellDates:false 로 읽어 날짜 칸이 일련번호로 옵니다(시간대 영향 없이 정확). */
@@ -101,9 +104,9 @@
     if (v == null || v === '') return out;
     if (v instanceof Date || Object.prototype.toString.call(v) === '[object Date]') {
       if (isNaN(v.getTime())) return out;
-      var d = new Date(Math.round(v.getTime() / 60000) * 60000);
+      var d = new Date(v.getTime());
       out.date = isoOk(d.getFullYear(), d.getMonth() + 1, d.getDate());
-      out.time = (d.getHours() || d.getMinutes()) ? hm(d.getHours(), d.getMinutes()) : '';
+      out.time = (d.getHours() || d.getMinutes() || d.getSeconds()) ? hms(d.getHours(), d.getMinutes(), d.getSeconds() || null) : '';
       return out;
     }
     if (typeof v === 'number') {
@@ -114,8 +117,8 @@
       return out;
     }
     var s = String(v).trim();
-    var m = /^(\d{4})[-./년\s]+(\d{1,2})[-./월\s]+(\d{1,2})일?(?:[T\s]+(\d{1,2}):(\d{2})(?::\d{2})?)?/.exec(s);
-    if (m) { out.date = isoOk(+m[1], +m[2], +m[3]); if (out.date && m[4] != null) out.time = hm(+m[4], +m[5]); return out; }
+    var m = /^(\d{4})[-./년\s]+(\d{1,2})[-./월\s]+(\d{1,2})일?(?:[T\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?/.exec(s);
+    if (m) { out.date = isoOk(+m[1], +m[2], +m[3]); if (out.date && m[4] != null) out.time = hms(+m[4], +m[5], m[6] == null ? null : +m[6]); return out; }
     m = /^(\d{4})(\d{2})(\d{2})$/.exec(s);
     if (m) { out.date = isoOk(+m[1], +m[2], +m[3]); return out; }
     if (/^\d{5}(\.\d+)?$/.test(s)) return toDateTime(Number(s));
@@ -126,8 +129,8 @@
   function toTime(v) {
     if (v == null || v === '') return '';
     if (typeof v === 'number') return v >= 0 && v < 1 ? timeFromFraction(v) : '';
-    var m = /^(\d{1,2}):(\d{2})/.exec(String(v).trim());
-    return m ? hm(+m[1], +m[2]) : '';
+    var m = /^(\d{1,2}):(\d{2})(?::(\d{2}))?/.exec(String(v).trim());
+    return m ? hms(+m[1], +m[2], m[3] == null ? null : +m[3]) : '';
   }
   function isoToUTC(iso) { var p = iso.split('-'); return Date.UTC(+p[0], +p[1] - 1, +p[2]); }
   function addDays(iso, n) { return isoFromUTC(isoToUTC(iso) + n * 86400000); }
@@ -190,6 +193,17 @@
       var fid = matchField(text);
       if (fid && out.map[fid] == null) { out.map[fid] = c3; out.units[fid] = splitHeader(text).unit; }
       else if (fid) out.warnings.push('「' + text + '」 열이 두 번 나옵니다. 앞의 것(' + colName(out.map[fid]) + ')을 씁니다.');
+    }
+    // 시각이 있는 센서 로그 양식의 「금형 타수」는 누적 카운터입니다.
+    // 기존 일별 로그는 행별 타수 해석을 유지합니다. 수동 열 연결은 아래에서 우선합니다.
+    if (out.map.strokes != null && splitHeader(out.headers[out.map.strokes]).key === '금형타수' &&
+        out.map.pressCum != null && out.map.dieCum == null && aoa.slice(best + 1).some(function (row) {
+          return toDateTime(row[out.map.date]).time || (out.map.time != null && toTime(row[out.map.time]));
+        })) {
+      out.map.dieCum = out.map.strokes;
+      out.units.dieCum = out.units.strokes;
+      delete out.map.strokes; delete out.units.strokes;
+      out.warnings.push('시각이 있는 프레스 로그의 「금형 타수」를 금형 누적 타수로 연결했습니다. 실제 타수는 누적값의 차이로 계산합니다.');
     }
     // 사용자가 고른 연결이 있으면 덮어씁니다 (값 -1 = 이 파일에는 없음)
     if (overrides) Object.keys(overrides).forEach(function (fid) {
@@ -266,7 +280,7 @@
 
   /* ── 5. 누적 · 중복 제거 ─────────────────────────────────────
      같은 행 = 일자 + 시각 + 프레스 + 금형. 다시 가져오면 새 값으로 바뀝니다. */
-  function recKey(r) { return [r.date, r.time || '', r.press, r.die || ''].join('|'); }
+  function recKey(r) { var t = r.time || ''; if (t.length === 5) t += ':00'; return [r.date, t, r.press, r.die || ''].join('|'); }
   function mergeRecords(existing, incoming) {
     var byKey = {}, stat = { added: 0, updated: 0 };
     (existing || []).forEach(function (r) { byKey[recKey(r)] = r; });
