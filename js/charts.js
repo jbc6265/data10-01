@@ -103,19 +103,24 @@
   /* 센서 관리도 — 날짜 간격대로 점을 찍고, 기준선(중앙값)·주의 한계·관리한계를 가로선으로, 최근 구간을 옅은 띠로.
      opts: { points:[{date, v, z, zone}], base:{center, upper, lower, upperWarn, lowerWarn}|null, recentFrom, unit, k, kWarn, title, color } */
   function dayNo(iso) { var p = iso.split('-'); return Date.UTC(+p[0], +p[1] - 1, +p[2]) / 86400000; }
+  function pointNo(p) {
+    var t = (p.time || '00:00:00').split(':').map(Number);
+    return dayNo(p.date) + (t[0] * 3600 + t[1] * 60 + (t[2] || 0)) / 86400;
+  }
   function sensorChart(opts) {
     var W = 640, H = 230, padL = 52, padR = 14, padT = 12, padB = 30;
     var pts = opts.points || [], unit = opts.unit || '';
-    var svg = el('svg', { viewBox: '0 0 ' + W + ' ' + H, class: 'chart sensor', role: 'img', 'aria-label': opts.title || '' });
+    var svg = el('svg', { viewBox: '0 0 ' + W + ' ' + H, class: 'chart sensor' + (opts.timed ? ' sensor-timed' : ''), role: 'img', 'aria-label': opts.title || '' });
     if (!pts.length) { svg.appendChild(el('text', { x: W / 2, y: H / 2, 'text-anchor': 'middle', class: 'tick' }, '표시할 값이 없습니다')); return svg; }
     var b = opts.base;
     var vals = pts.map(function (p) { return p.v; });
     if (b) vals = vals.concat([b.upper, b.lower]);
     var lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals), span = hi - lo || Math.abs(hi) * 0.1 || 1;
     lo -= span * 0.08; hi += span * 0.08;
-    var x0 = dayNo(pts[0].date), x1 = dayNo(pts[pts.length - 1].date); if (x1 === x0) x1 = x0 + 1;
+    var x0 = pointNo(pts[0]), x1 = pointNo(pts[pts.length - 1]); if (x1 === x0) x1 = x0 + (opts.timed ? 2 / 86400 : 1);
     var plotW = W - padL - padR, plotH = H - padT - padB;
     function X(iso) { return padL + (dayNo(iso) - x0) / (x1 - x0) * plotW; }
+    function PX(p) { return padL + (pointNo(p) - x0) / (x1 - x0) * plotW; }
     function Y(v) { return padT + (hi - v) / (hi - lo) * plotH; }
     if (opts.recentFrom && dayNo(opts.recentFrom) <= x1) {
       var rx = Math.max(padL, X(opts.recentFrom) - 4);
@@ -129,8 +134,13 @@
     }
     var nT = 6;
     for (var t = 0; t <= nT; t++) {
-      var dn = x0 + (x1 - x0) * t / nT, d = new Date(Math.round(dn) * 86400000);
-      svg.appendChild(el('text', { x: padL + plotW * t / nT, y: H - 10, 'text-anchor': t === 0 ? 'start' : t === nT ? 'end' : 'middle', class: 'tick' }, (d.getUTCMonth() + 1) + '/' + d.getUTCDate()));
+      var dn = x0 + (x1 - x0) * t / nT, d = new Date(Math.round(dn * 86400) * 1000);
+      var label = (d.getUTCMonth() + 1) + '/' + d.getUTCDate();
+      if (opts.timed) {
+        var clock = d.toISOString().slice(11, 19);
+        label = pts[0].date === pts[pts.length - 1].date ? clock : label + ' ' + clock;
+      }
+      svg.appendChild(el('text', { x: padL + plotW * t / nT, y: H - 10, 'text-anchor': t === 0 ? 'start' : t === nT ? 'end' : 'middle', class: 'tick' }, label));
     }
     if (b) {
       [['upper', 'lim'], ['lower', 'lim'], ['upperWarn', 'lim-warn'], ['lowerWarn', 'lim-warn'], ['center', 'center']].forEach(function (x) {
@@ -141,13 +151,13 @@
       });
     }
     var dpath = '';
-    pts.forEach(function (p, i) { dpath += (i ? 'L' : 'M') + X(p.date).toFixed(1) + ' ' + Y(p.v).toFixed(1) + ' '; });
+    pts.forEach(function (p, i) { dpath += (i ? 'L' : 'M') + PX(p).toFixed(1) + ' ' + Y(p.v).toFixed(1) + ' '; });
     svg.appendChild(el('path', { d: dpath, class: 'ln', style: 'stroke:' + (opts.color || 'var(--series-1)') }));
     pts.forEach(function (p) {
       var az = p.z == null || p.zone !== 'recent' ? 0 : Math.abs(p.z); // 색 표시는 최근 구간만(기준선 구간은 비교 대상)
       var cls = 'dot' + (opts.k && az >= opts.k ? ' dot-bad' : opts.kWarn && az >= opts.kWarn ? ' dot-warn' : '');
-      var c = el('circle', { cx: X(p.date), cy: Y(p.v), r: az >= (opts.kWarn || 99) ? 4.5 : 3, class: cls, style: cls === 'dot' ? 'fill:' + (opts.color || 'var(--series-1)') : '' });
-      c.appendChild(el('title', null, p.date + ' · ' + fmt(p.v) + unit + (p.z != null ? ' · z ' + (Math.round(p.z * 10) / 10) : '')));
+      var c = el('circle', { cx: PX(p), cy: Y(p.v), r: opts.timed ? 1.5 : az >= (opts.kWarn || 99) ? 4.5 : 3, class: cls, style: cls === 'dot' ? 'fill:' + (opts.color || 'var(--series-1)') : '' });
+      c.appendChild(el('title', null, p.date + (p.time ? ' ' + p.time : '') + ' · ' + p.v + unit + (p.z != null ? ' · z ' + (Math.round(p.z * 10) / 10) : '')));
       svg.appendChild(c);
     });
     return svg;
@@ -157,9 +167,9 @@
     var cap = document.createElement('figcaption'); cap.textContent = title; f.appendChild(cap);
     opts.title = title;
     var lg = document.createElement('div'); lg.className = 'legend';
-    lg.innerHTML = '<span class="lg"><i style="background:' + (opts.color || 'var(--series-1)') + '"></i>하루 평균</span>' +
+    lg.innerHTML = '<span class="lg"><i style="background:' + (opts.color || 'var(--series-1)') + '"></i>' + (opts.timed ? '수집 시각별 측정값' : '하루 평균') + '</span>' +
       (opts.base ? '<span class="lg"><i class="sw-center"></i>기준선</span><span class="lg"><i class="sw-warn"></i>주의 한계</span><span class="lg"><i class="sw-lim"></i>관리한계</span>' : '') +
-      '<span class="lg"><i class="sw-zone"></i>최근 구간</span>';
+      (opts.recentFrom ? '<span class="lg"><i class="sw-zone"></i>최근 구간</span>' : '');
     f.appendChild(lg);
     f.appendChild(sensorChart(opts));
     return f;
