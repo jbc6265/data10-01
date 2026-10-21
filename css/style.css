@@ -2,32 +2,38 @@
    뼈대(짙은 남색 사이드바 + 밝은 본문)는 data09-25 에서, 대시보드(머리 띠·지표 4칸)는 data09-17 에서 가져왔습니다.
    360px 까지 반응형, 좁은 화면에서는 사이드바가 위쪽 메뉴로 바뀝니다. 그래프 색은 --series-* 변수. */
 :root {
+  /* 첨부된 HD현대 컬러 시스템의 RGB/HEX 기준값 */
+  --hd-eco-green: #00e600;
+  --hd-heritage-green: #00ad1d;
+  --hd-prosperity-green: #008233;
+  --hd-discovery-blue: #003087;
+  --hd-trust-blue: #002554;
   --container-pad: 16px;
   --bg: #f3f6fa;
   --surface: #ffffff;
-  --text: #16202c;
+  --text: #002554;
   --muted: #56616f;
   --line: #d6dde6;
-  --primary: #2f73d9;
-  --primary-dark: #215cb4;
-  --primary-soft: #e8f0fc;
+  --primary: var(--hd-discovery-blue);
+  --primary-dark: var(--hd-trust-blue);
+  --primary-soft: #eaf0f8;
   --on-primary: #ffffff;
-  --side: #13274b;
-  --side-2: #183a66;
+  --side: var(--hd-trust-blue);
+  --side-2: var(--hd-discovery-blue);
   --on-side: #e7eef8;
-  --on-side-muted: #9fb2cc;
+  --on-side-muted: #bdcde0;
   --danger: #b3261e;
   --warn-bg: #fff4d6;
-  --ok: #1b6e3a;
-  --fact: #1b6e3a;
+  --ok: var(--hd-prosperity-green);
+  --fact: var(--hd-prosperity-green);
   --obs: #8a4b00;
   --radius: 10px;
-  --series-1: #2a78d6;    /* 전류 · 첫 번째 종류 */
+  --series-1: var(--hd-discovery-blue); /* 전류 · 첫 번째 종류 */
   --series-2: #d9601f;    /* 온도 */
-  --series-3: #178a62;    /* 진동 */
+  --series-3: var(--hd-prosperity-green); /* 진동 */
   --series-4: #7a55c7;    /* 전압 */
-  --series-5: #9aa7b8;
-  --lv-ok: #1b6e3a;  --lv-ok-bg: #e5f4ea;
+  --series-5: var(--hd-trust-blue);
+  --lv-ok: var(--hd-prosperity-green); --lv-ok-bg: #e5f4ea;
   --lv-warn: #7a5200; --lv-warn-bg: #fff1cc; --lv-warn-line: #d39b00;
   --lv-bad: #a3221b;  --lv-bad-bg: #fde8e6;
   --lv-none: #56616f; --lv-none-bg: #eef1f5;
@@ -65,9 +71,9 @@ a { color: var(--primary); }
 
 /* ── 뼈대: 사이드바 + 본문 ─────────────────── */
 .shell { display: grid; grid-template-columns: 250px minmax(0, 1fr); min-height: 100vh; }
-.side { background: var(--side); color: var(--on-side); padding: 20px 12px; position: sticky; top: 0; height: 100vh; overflow-y: auto; }
+.side { background: var(--side); color: var(--on-side); padding: 20px 12px; position: sticky; top: 0; height: 100vh; overflow-y: auto; border-top: 4px solid var(--hd-eco-green); }
 .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; color: var(--on-side); padding: 0 8px 18px; }
-.brand-mark { font-weight: 800; font-size: 1.4rem; letter-spacing: .02em; }
+.brand-mark { font-weight: 800; font-size: 1.4rem; letter-spacing: .02em; color: var(--hd-eco-green); }
 .brand-text { display: flex; flex-direction: column; min-width: 0; }
 .brand-name { font-weight: 800; font-size: 1.05rem; }
 .brand-sub { font-size: .78rem; color: var(--on-side-muted); }
@@ -80,8 +86,8 @@ a { color: var(--primary); }
 .nav a .t { font-weight: 700; font-size: .95rem; }
 .nav a .s { grid-column: 2; font-size: .78rem; color: var(--on-side-muted); }
 .nav a:hover { background: rgba(255, 255, 255, .06); }
-.nav a[aria-current="page"] { background: var(--side-2); }
-.nav a[aria-current="page"] .no { color: #7fb0ff; }
+.nav a[aria-current="page"] { background: var(--side-2); box-shadow: inset 3px 0 var(--hd-heritage-green); }
+.nav a[aria-current="page"] .no { color: var(--hd-eco-green); }
 
 .body { min-width: 0; display: flex; flex-direction: column; }
 .topbar {
@@ -92,7 +98,7 @@ a { color: var(--primary); }
 .scope-chip {
   display: inline-flex; flex-wrap: wrap; gap: 2px 8px; align-items: center; min-width: 0; max-width: 100%;
   padding: 6px 14px; border-radius: 16px; background: var(--primary-soft); border: 1px solid #c3d6f3;
-  color: #17427e; font-weight: 700; font-size: .9rem; text-decoration: none;
+  color: var(--hd-discovery-blue); font-weight: 700; font-size: .9rem; text-decoration: none;
 }
 .scope-chip .dim { font-weight: 500; color: var(--muted); }
 .topbar-note { margin-left: auto; font-size: .85rem; color: var(--muted); }
@@ -252,6 +258,9 @@ svg.chart .axis { stroke: #b9c2ce; stroke-width: 1; }
 svg.chart .tick { fill: var(--muted); font-size: 12px; }
 svg.chart .ln { fill: none; stroke-width: 2; stroke-linejoin: round; }
 svg.chart .dot { stroke: var(--surface); stroke-width: 2; }
+/* 촘촘한 시계열에서 점의 흰 테두리가 센서 곡선을 덮지 않도록 합니다. */
+svg.chart.sensor-timed .dot { stroke: none; }
+svg.chart.sensor-timed .ln { stroke-width: 2; }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: .82rem; color: var(--muted); min-height: 4px; }
 .legend .lg { display: inline-flex; align-items: center; gap: 6px; }
 .legend i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
